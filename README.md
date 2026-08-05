@@ -14,8 +14,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.02.00.42`
-- Dashboard: `v2026.08.02.02.34`
+- Scheduler: `v2026.08.05.11.22`
+- Dashboard: `v2026.08.05.11.22`
 
 The tested system uses:
 
@@ -220,7 +220,7 @@ Late Charge Acceptance can delay charging into a slightly more expensive later p
 
 ### Self-consumption allocation
 
-The planner estimates how many expensive periods can be covered by current battery energy, planned charging, forecast solar, and expected house consumption. These periods use native Self-Consumption so the inverter handles the real-time power flow internally.
+The planner estimates how many expensive periods can be covered by current battery energy, planned charging, forecast solar, and expected house consumption. These periods use native Self-Consumption so the inverter handles the real-time power flow internally. Deficit-day economic allocation uses the exact import tariff from `sensor.nordpool_kwh_se3_sek_4_10_025` and the exact export tariff from `sensor.nordpool_kwh_se3_sek_5_00_0`. Both sensors report SEK/kWh and are converted internally to öre/kWh.
 
 ### Sell logic
 
@@ -353,10 +353,12 @@ The current files refer to entity IDs from one specific Home Assistant installat
 | Grid power | `sensor.solax_inverter_meter_active_power` |
 | Battery power | `sensor.solax_inverter_battery_power` |
 | PV power | `sensor.solax_inverter_pv_power_total` |
-| Battery SOC | `sensor.solax_inverter_battery_soc` |
+| Decimal planner SOC | `sensor.force_h3_battery_percent` |
+| Inverter SOC (runtime safety guard) | `sensor.solax_inverter_battery_soc` |
 | Battery rated capacity | `sensor.solax_inverter_battery_rated_capacity` |
-| BMS maximum charging current | `sensor.force_h3_max_charging_current` |
-| BMS maximum discharging current | `sensor.force_h3_max_discharging_current` |
+| Battery voltage | `sensor.solax_inverter_battery_voltage` |
+| BMS maximum charging current | `sensor.solax_inverter_battery_charge_limit` |
+| BMS maximum discharging current | `sensor.solax_inverter_battery_discharge_limit` |
 | House cumulative energy | `sensor.solax_inverter_house_energy_total` |
 
 ### Price and PV forecast entities
@@ -364,7 +366,8 @@ The current files refer to entity IDs from one specific Home Assistant installat
 | Purpose | Current entity ID |
 |---|---|
 | Planner price series | `sensor.nordpool_kwh_se3_sek_0_200000_0` |
-| Fee-inclusive import/export calculations | `sensor.nordpool_kwh_se3_sek_4_10_0`, `sensor.nordpool_kwh_se3_sek_5_00_0` |
+| Exact import price (SEK/kWh) | `sensor.nordpool_kwh_se3_sek_4_10_025` |
+| Exact export price (SEK/kWh) | `sensor.nordpool_kwh_se3_sek_5_00_0` |
 | Solcast today | `sensor.solcast_pv_forecast_forecast_today` |
 | Solcast tomorrow | `sensor.solcast_pv_forecast_forecast_tomorrow` |
 | Solcast remaining today | `sensor.solcast_pv_forecast_forecast_remaining_today` |
