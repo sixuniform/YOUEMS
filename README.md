@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright 2026 Rickard Dahlstedt -->
+
 # YOUEMS
 
 **YOUEMS** is a Home Assistant energy-management system for a Solinteg hybrid inverter and battery. It combines Nord Pool electricity prices, Solcast PV forecasts, measured household consumption, battery state, and inverter feedback to create and execute a rolling 15-minute energy schedule.
@@ -14,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.05.11.22`
-- Dashboard: `v2026.08.05.11.22`
+- Scheduler: `v2026.08.07.23.34`
+- Dashboard: `v2026.08.07.23.34`
 
 The tested system uses:
 
@@ -90,8 +93,8 @@ All qEMS modes use `EMS BattCtrl`. Home Assistant calculates or maintains the ba
 |---|---|
 | **qEMS Feed-In** | Exports available PV while preventing grid import. If PV is below household demand, the battery may cover the deficit. |
 | **qEMS Self-Consumption** | External zero-grid-style self-consumption. The battery target is continuously adjusted to balance household demand after PV. |
-| **qEMS PV Charge** | Sends all available PV toward battery charging while the house is supplied separately from the grid. The grid is not allowed to charge the battery. |
-| **qEMS PV Charge+House** | PV supplies the house first and remaining PV charges the battery. Battery discharge is prevented. |
+| **qEMS PV Charge** | Sends available PV toward battery charging first. Inverter AC input is blocked for battery charging, but **this is not a site-level no-import mode**: the house may still import from the grid while PV is reserved for the battery. |
+| **qEMS PV Charge+House** | PV supplies the house first and only remaining PV charges the battery. Battery discharge is prevented and grid charging of the battery is blocked. This is normally preferable when the goal is to avoid importing house load merely to prioritize battery charging. |
 | **qEMS Battery Charge** | Charges the battery at a requested fixed power. Grid charging is allowed. |
 | **qEMS Battery Discharge** | Discharges at least the requested power while also covering higher household demand when needed. |
 | **qEMS Battery Freeze** | Requests zero battery power and blocks both inverter AC directions. It is intended primarily for no-solar periods where the grid should supply the house and the battery must remain untouched. |
@@ -108,7 +111,7 @@ The qEMS controller runs once per second by default. It reads:
 - BMS maximum charging current
 - BMS maximum discharging current
 - Current BattCtrl target
-- Current EMS import/export limits
+- Current EMS inverter AC import/output limits
 
 The controller then calculates a safe battery target for the active mode.
 
@@ -142,11 +145,13 @@ Battery Charge and Battery Discharge selected manually from the Inverter card be
 When entering `EMS BattCtrl`, YOUEMS always changes the inverter working mode first. Only after Home Assistant confirms `EMS BattCtrl` does it write:
 
 1. PV priority
-2. Maximum grid export
-3. Maximum grid import
+2. Maximum inverter AC output (register 50208; often labelled "Max Grid Export" by integrations)
+3. Maximum inverter AC input (register 50209; often labelled "Max Grid Import" by integrations)
 4. Initial BattCtrl target
 
-This order matters because BattCtrl parameters written before the working-mode change are not guaranteed to survive it.
+This order matters because BattCtrl parameters written before the working-mode change may be stored/read back but still not be enforced by the inverter. **Register readback is therefore not proof that a pre-mode write took effect.** YOUEMS always enters and confirms `EMS BattCtrl` first, then writes the complete priority/limit/target set.
+
+When qEMS is not active, working-mode changes also reassert unrestricted EMS AC limits, so restrictive settings left by a previous qEMS profile are not intentionally carried into another inverter mode. The inverter's actual working mode remains authoritative: if it is changed externally while a schedule is already running, qEMS stops rather than fighting the external change.
 
 When the requested qEMS sub-mode is already active, YOUEMS preserves the live target and performs no initialization writes. This prevents a schedule boundary from momentarily resetting a battery that is charging or discharging at high power.
 
@@ -254,8 +259,9 @@ The planner can begin at the first forecast PV period. It uses price hysteresis 
 
 After charge, sell, Feed-In, and protected periods are allocated, all remaining periods receive one of these modes:
 
-- **Self-Consumption** when projected battery energy and solar can cover the plan.
-- **qEMS PV Charge** during useful solar when additional battery energy is required.
+- **Self-Consumption** when projected battery energy and solar can cover the plan, and after the battery is effectively full.
+- **qEMS PV Charge** when battery recovery needs priority and using PV for the battery even if the house temporarily imports is economically/physically useful.
+- **qEMS PV Charge+House** when forecast PV can supply the house first and the remaining surplus is still sufficient to refill the battery safely.
 - **qEMS Battery Freeze** during no-solar deficit periods, preserving the battery while the grid supplies the load.
 
 ## Schedule storage and execution
@@ -275,6 +281,12 @@ Each schedule stores:
 - Requested power where applicable
 
 The executor starts and stops modes at their scheduled boundaries. Consecutive periods with the same effective mode are handed over without unnecessary inverter writes.
+
+### Schedule state reconciliation
+
+Exact-minute start/stop triggers remain the normal execution path, but YOUEMS also runs a self-healing reconciliation watchdog at Home Assistant startup and once per minute. It determines which enabled schedule should contain the current time (manual slots take priority over automatic slots) and repairs missed starts or stale active-slot bookkeeping. This covers Home Assistant restarts across a boundary, a missed template-trigger minute, and a replan that commits just after the boundary.
+
+The watchdog deliberately does **not** force a qEMS mode back on when the expected slot is already tracked but the inverter working mode was changed externally. That preserves the safety invariant that the inverter/UI is authoritative and prevents a control tug-of-war.
 
 During a replan, the complete replacement schedule is built in memory. The previous automatic schedule remains active until the replacement is ready, and only changed slot helpers are committed. This reduced measured replan time on the reference Home Assistant system from approximately **15.7 seconds to 4.6 seconds** and prevented most missed qEMS write cycles.
 
@@ -336,6 +348,10 @@ The Inverter card’s **Sub Mode** dropdown is a command selector. It returns to
 
 The current files refer to entity IDs from one specific Home Assistant installation. Adapt them before use.
 
+### EMS limit terminology
+
+The Solax/Solinteg integration and official register descriptions may use names such as **Max Grid Export** and **Max Grid Import** for BattCtrl registers 50208/50209. In observed MHT firmware behavior these are **inverter-side AC output/input limits**, not utility-meter/site limits. House load is outside that limit calculation, so site import can exceed the configured inverter AC input limit and site export can be lower than the configured inverter AC output. Do not use these registers as service-fuse or whole-site import/export protection.
+
 ### Essential inverter controls
 
 | Purpose | Current entity ID |
@@ -343,8 +359,8 @@ The current files refer to entity IDs from one specific Home Assistant installat
 | Working mode | `select.solax_inverter_working_mode` |
 | BattCtrl target | `number.solax_inverter_battery_charge_discharge_power_target` |
 | BattCtrl PV priority | `select.solinteg_inverter_solax_inverter_ems_battctrl_priority_of_power_output` |
-| BattCtrl maximum AC output | `number.solinteg_inverter_solax_inverter_ems_battctrl_max_ac_power_limit` |
-| BattCtrl minimum AC input | `number.solinteg_inverter_solax_inverter_ems_battctrl_min_ac_power_limit` |
+| BattCtrl maximum inverter AC output | `number.solinteg_inverter_solax_inverter_ems_battctrl_max_ac_power_limit` |
+| BattCtrl maximum inverter AC input | `number.solinteg_inverter_solax_inverter_ems_battctrl_min_ac_power_limit` |
 
 ### Essential power and battery sensors
 
@@ -373,6 +389,14 @@ The current files refer to entity IDs from one specific Home Assistant installat
 | Solcast remaining today | `sensor.solcast_pv_forecast_forecast_remaining_today` |
 
 The Solcast forecast entities must expose a `detailedForecast` attribute containing period start times and PV estimates.
+
+## Documentation acknowledgements
+
+Independent Solinteg testing and review from [hspolander/solinteg-controller-oss](https://github.com/hspolander/solinteg-controller-oss) helped confirm and sharpen several EMS BattCtrl documentation points, including the mode-before-register write-order requirement, the fact that a pre-mode limit can read back correctly without being enforced, and the inverter-side (not utility-meter-side) meaning of registers 50208/50209. The PV Charge house-import behavior was also independently reproduced there.
+
+## License and attribution
+
+YOUEMS is distributed under the **Apache License 2.0**. See `LICENSE` for the license text and `NOTICE` for attribution information. You may use, copy, and modify the project under those terms. Redistributed or published derivatives should retain the copyright/license notices and the YOUEMS attribution notice, including a link back to the original YOUEMS source repository from which the work was obtained.
 
 ## Installation
 
