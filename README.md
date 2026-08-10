@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.07.23.34`
-- Dashboard: `v2026.08.07.23.34`
+- Scheduler: `v2026.08.09.13.03`
+- Dashboard: `v2026.08.09.13.03`
 
 The tested system uses:
 
@@ -166,6 +166,24 @@ When the requested qEMS sub-mode is already active, YOUEMS preserves the live ta
 - A remembered qEMS sub-mode is considered valid only while the inverter is actually in `EMS BattCtrl`.
 - No battery charge-current or discharge-current registers are changed by YOUEMS.
 
+## Shadow SOC estimator
+
+YOUEMS keeps two Shadow SOC values. **Raw Shadow SOC** (`sensor.youems_shadow_battery_soc`) is deliberately unbounded and remains a diagnostic/calibration value: it may go below 0% or above 100% so accumulated measurement error remains visible. **Operational Shadow SOC** (`sensor.youems_operational_shadow_soc`) is the physically guarded 0–100% value used by the planner and by charge-acceptance bucket selection.
+
+The estimator is anchored automatically only at a verified full-charge endpoint. During a continuous charge it arms when either SOC source reaches the high-SOC region (>=95%) while charge direction and BMS charge permission still indicate charging; a one-minute watchdog provides the same recovery if the exact crossing event is missed. When BMS maximum charge current subsequently transitions to zero after measurable charge movement, the endpoint is anchored as exactly 100%. There is deliberately no automatic low-SOC anchor. Manual re-sync controls remain available for diagnostics and recovery.
+
+`input_number.youems_shadow_charge_loss_pct` is a separate Shadow-SOC measurement correction, adjustable from **0.0 to 5.0% in 0.1% steps**. It reduces measured charge energy before treating it as newly stored battery energy:
+
+```text
+stored charge = measured charge × (1 - Shadow Charge Loss / 100)
+```
+
+This setting is intentionally independent of the planner's charge/discharge or round-trip efficiency assumptions. It applies only to Shadow SOC charge accumulation; measured discharge energy is unchanged. Because the correction is applied when Shadow SOC is calculated rather than destructively written into the accumulated charge counter, changing the slider also recalculates the charge movement already accumulated since the current Shadow anchor.
+
+To avoid hiding calibration error, raw Shadow SOC is never clamped. If raw Shadow SOC is above 100% when genuine discharge begins, YOUEMS latches the excess above 100% as a persistent **top correction**. Operational Shadow SOC then subtracts that correction before applying the physical 0–100% bounds. For example, if raw Shadow SOC is 102% when discharge starts, Operational Shadow SOC begins at 100%; when raw later reaches 90%, Operational Shadow SOC is 88%. This avoids a 2%-wide discharge dead zone while preserving the 102% raw value for diagnosis. The correction can only increase until the next trusted full/manual Shadow anchor, where it is cleared. The raw value immediately before a full anchor is retained as a diagnostic full-cycle error.
+
+The planner now starts from Operational Shadow SOC. Force H3 SOC is retained only as an availability fallback if the operational Shadow estimator is temporarily unavailable. qEMS/BMS runtime safety guards remain independent and continue to use inverter/BMS feedback rather than trusting the planner SOC estimate.
+
 ## How the planner works
 
 The planner uses a rolling look-ahead window, normally up to 48 hours. It combines:
@@ -190,6 +208,14 @@ Instead of using one flat daily average, YOUEMS divides consumption into four si
 - 18:00–24:00
 
 The package captures cumulative house-energy snapshots and averages available completed windows from up to three days. This produces a more realistic projected drain for each part of the day. A fallback daily estimate is used until enough history exists.
+
+### Learned charge acceptance in prediction
+
+YOUEMS learns the battery/BMS charge-acceptance ceiling in 2% SOC buckets and uses that curve when predicting how much energy can actually enter the battery during grid charge, PV Charge, PV Charge+House, and solar surplus charging. Plotly pSOC uses the same learned acceptance model.
+
+The learned curve is **prediction-only**. It never reduces the qEMS Battery Charge command. If the configured grid-charge power is 10 kW and the learned curve predicts that the battery will currently accept only 4.4 kW, YOUEMS still requests 10 kW; the BMS remains responsible for enforcing its real charge limit. This avoids undercharging if the learned curve is conservative or stale.
+
+Automatic grid-charge power is reduced only by the existing partial-final-slot logic: when the remaining required energy can be delivered without a full-power slot, the final slot is commanded at the calculated partial power (subject to Minimum Charge Power). The learned acceptance ceiling may cause the planner to reserve additional charge slots, but does not itself lower their requested power.
 
 ### Planner stages
 
