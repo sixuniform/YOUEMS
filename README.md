@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.09.13.03`
-- Dashboard: `v2026.08.09.13.03`
+- Scheduler: `v2026.08.12.15.03`
+- Dashboard: `v2026.08.12.15.03`
 
 The tested system uses:
 
@@ -29,6 +29,16 @@ The tested system uses:
 - Solax Modbus integration with Solinteg definitions
 - Nord Pool SE3 prices
 - Solcast PV forecasts
+- Unagi SE3 electricity-price forecast for dashboard preview only
+
+### Safe rollback baseline
+
+Immediately before the Feed-In average-price redesign, the user explicitly selected this pair as the new safe rollback/regression baseline:
+
+- Scheduler: `v2026.08.11.15.35`
+- Dashboard: `v2026.08.12.00.23`
+
+Keep those files available when diagnosing later planner regressions.
 
 ## What YOUEMS does
 
@@ -47,6 +57,7 @@ YOUEMS can:
 - Keep manual schedules protected while rebuilding automatic schedules.
 - Preview plans and inverter actions with Dry Run.
 - Display prices, forecast SOC, PV, schedules, status, savings, and planner diagnostics in a Lovelace dashboard.
+- Preview Unagi hourly next-day price estimates in Plotly whenever actual Nord Pool tomorrow prices are not yet available; Unagi is display-only and does not feed the planner.
 
 ## System architecture
 
@@ -95,7 +106,7 @@ All qEMS modes use `EMS BattCtrl`. Home Assistant calculates or maintains the ba
 | **qEMS Self-Consumption** | External zero-grid-style self-consumption. The battery target is continuously adjusted to balance household demand after PV. |
 | **qEMS PV Charge** | Sends available PV toward battery charging first. Inverter AC input is blocked for battery charging, but **this is not a site-level no-import mode**: the house may still import from the grid while PV is reserved for the battery. |
 | **qEMS PV Charge+House** | PV supplies the house first and only remaining PV charges the battery. Battery discharge is prevented and grid charging of the battery is blocked. This is normally preferable when the goal is to avoid importing house load merely to prioritize battery charging. |
-| **qEMS Battery Charge** | Charges the battery at a requested fixed power. Grid charging is allowed. |
+| **qEMS Battery Charge** | Charges at least the requested battery power, but automatically increases charging to absorb a larger PV surplus instead of exporting it. Grid charging is allowed for the requested shortfall. |
 | **qEMS Battery Discharge** | Discharges at least the requested power while also covering higher household demand when needed. |
 | **qEMS Battery Freeze** | Requests zero battery power and blocks both inverter AC directions. It is intended primarily for no-solar periods where the grid should supply the house and the battery must remain untouched. |
 
@@ -138,7 +149,28 @@ The tested defaults are applied once on a new installation and then persist acro
 | Maximum target step | 2 kW |
 | Maximum target | 10 kW |
 
-Battery Charge and Battery Discharge selected manually from the Inverter card begin at **0 kW**. The requested power must then be increased manually.
+Battery Charge and Battery Discharge selected manually from the Inverter card begin at **0 kW**. For Battery Charge, 0 kW is now a **minimum** rather than a fixed zero: available PV surplus may still charge the battery.
+
+### Battery Charge PV-surplus capture
+
+`qEMS Battery Charge` treats the requested power as a **minimum battery-charge magnitude**, symmetrical in spirit with Battery Discharge treating its requested power as a minimum discharge magnitude.
+
+Let `D = house load - PV = battery - grid`, where negative `D` means PV surplus, and let `R` be the requested positive charge magnitude. The controller uses:
+
+```text
+target = min(-R, D)
+```
+
+Equivalently, the battery charge magnitude is `max(R, PV surplus)`, bounded by qEMS Maximum Target and by the inverter/BMS.
+
+Examples:
+
+- Request 4 kW, PV surplus 1 kW → battery target ≈ -4 kW; grid supplies the remaining ≈3 kW.
+- Request 4 kW, PV surplus 6 kW → battery target ≈ -6 kW; the extra PV is absorbed rather than exported.
+- Request 0 kW, PV surplus 6 kW → battery target ≈ -6 kW; no grid battery charging is requested, but free PV is still captured.
+- If PV surplus exceeds the configured qEMS maximum target or BMS acceptance, the unavoidable excess may still export.
+
+This mode therefore requires fresh grid and battery feedback. The PV sensor itself remains diagnostic because `battery - grid` already yields demand after PV.
 
 ### Mode activation order
 
@@ -162,6 +194,7 @@ When the requested qEMS sub-mode is already active, YOUEMS preserves the live ta
 - Large target changes can be limited by Maximum Target Step.
 - Grid noise inside the deadband is treated as zero.
 - The fast loop writes only when the target change passes the configured threshold, except for urgent safety correction.
+- Battery Charge is feedback-driven: its target may rise above the requested minimum when measured PV surplus is larger.
 - If the inverter leaves `EMS BattCtrl`, the qEMS controller stops and clears its remembered sub-mode without forcing the inverter back.
 - A remembered qEMS sub-mode is considered valid only while the inverter is actually in `EMS BattCtrl`.
 - No battery charge-current or discharge-current registers are changed by YOUEMS.
@@ -211,9 +244,21 @@ The package captures cumulative house-energy snapshots and averages available co
 
 ### Learned charge acceptance in prediction
 
-YOUEMS learns the battery/BMS charge-acceptance ceiling in 2% SOC buckets and uses that curve when predicting how much energy can actually enter the battery during grid charge, PV Charge, PV Charge+House, and solar surplus charging. Plotly pSOC uses the same learned acceptance model.
+YOUEMS learns the battery/BMS charge-acceptance ceiling with **non-uniform SOC buckets** so resolution is concentrated where the Force H3 actually changes its permitted charging current:
+
+- 10–60%: 5%-spaced bucket starts (`10, 15, …, 60`)
+- 60–85%: 2%-spaced bucket starts (`62, 64, …, 84`; the 60% bucket covers 60–62%)
+- 85–100%: 1% buckets (`85, 86, …, 99`)
+
+This produces 38 buckets. The curve is used when predicting how much energy can actually enter the battery during grid charge, PV Charge, PV Charge+House, and solar-surplus charging. For scheduled Battery Charge, prediction now uses the larger of the scheduled minimum charge request and forecast PV surplus, capped at the qEMS maximum target, matching the runtime controller's PV-surplus capture behavior. Plotly pSOC uses the same rule and the same bucket map/learned acceptance model.
+
+To avoid learning temporary BMS restrictions or unusually high limits after shallow/partial cycles, charge-acceptance learning now requires a **qualified deep-charge session**. A session arms only when genuine battery charging is seen at or below **50% Operational Shadow SOC**. Once armed, YOUEMS may learn continuously on the upward charge through the higher SOC buckets. The session is discarded at full (>=99.9%), if Operational Shadow SOC falls at least 1.0 percentage point from the session peak, or if genuine charging is absent for five minutes. Home Assistant restart also starts disarmed, so an upper-SOC charge already in progress after restart is not treated as a qualified learning cycle. Brief pauses below five minutes are tolerated. The existing learned curve is not reset by this change.
 
 The learned curve is **prediction-only**. It never reduces the qEMS Battery Charge command. If the configured grid-charge power is 10 kW and the learned curve predicts that the battery will currently accept only 4.4 kW, YOUEMS still requests 10 kW; the BMS remains responsible for enforcing its real charge limit. This avoids undercharging if the learned curve is conservative or stale.
+
+If the curve is not fully learned, an unlearned SOC bucket (stored as 0), or an invalid/missing curve, is treated as **no known restriction**: prediction assumes the full requested or currently available charging power can be absorbed. Learned values only reduce predicted acceptance where an actual positive value exists.
+
+The current package has no legacy 45→38 migration or startup recovery logic. The 38-value curve and 38-value sample-count stores are now the only supported format. A bucket whose sample count is zero treats its first valid observation as authoritative and replaces any stored seed immediately; after that, lower observations replace immediately and higher observations recover at 10% per sample. The manual **Reset Charge Acceptance Curve** control remains the explicit way to initialize or clear the stores.
 
 Automatic grid-charge power is reduced only by the existing partial-final-slot logic: when the remaining required energy can be delivered without a full-power slot, the final slot is commanded at the calculated partial power (subject to Minimum Charge Power). The learned acceptance ceiling may cause the planner to reserve additional charge slots, but does not itself lower their requested power.
 
@@ -280,6 +325,20 @@ The planner can begin at the first forecast PV period. It uses price hysteresis 
 - Feed-In ends before the third below-threshold period.
 - New Feed-In periods are limited to the morning/early daytime window.
 - The planner verifies that sufficient forecast energy and charging time remain to restore the battery afterward.
+
+**Minimum Feed-In Price Advantage** is a plain price comparison. YOUEMS identifies the morning 15-minute periods where Feed-In actually creates additional export, and the later periods where delayed charging would genuinely displace export after the battery catches up. Each qualifying period contributes its Nord Pool price **once**, regardless of how many kWh are exported in that period.
+
+The decision is therefore:
+
+```text
+average morning Feed-In price
+- average later displaced-export price
+>= Minimum Feed-In Price Advantage
+```
+
+PV quantity still determines physical feasibility, SOC, recharge time, learned charge acceptance, and which later periods are genuinely displaced. It does **not** weight the price comparison. For example, selling 1 kWh at 30 öre is considered a better timing opportunity than later selling 2 kWh at 20 öre when the configured price advantage allows it; the larger later energy volume no longer wins merely because its total revenue is larger.
+
+A setting of **0 Öre/kWh** allows equal average prices. After a Feed-In block has started, a weak 15-minute extension can remain provisional for up to one hour so following higher-price periods can rescue the equal-weighted average. If that one-hour extension still does not meet the configured price advantage, Feed-In ends before the first weak period.
 
 ### Final gap fill
 
@@ -368,6 +427,10 @@ The only custom Lovelace card currently required by the supplied dashboard is:
 
 - **Plotly Graph Card** (`custom:plotly-graph`)
 
+The Plotly projected-SOC trace uses a fixed **0–100% pSOC scale** and keeps full internal SOC precision instead of rounding plotted points to whole percentages. Hover text shows pSOC with one decimal. While the simulated battery is charging, its hover text also shows the charge-acceptance ceiling for that SOC bucket, for example `94.3% pSOC (⚡≤4.4 kW)`. A trailing `*` means the bucket is not learned and the display is showing the configured maximum-target assumption; the prediction itself continues to assume the full requested/available charging power can be absorbed for an unlearned bucket.
+
+The thin Plotly history strip is backed by `input_text.schedule_history`, a compact newest-first interval stream encoded as `15-minute-index|period-count|mode-code`. Because Home Assistant `input_text` is limited to 255 characters, the writer normalizes the complete stream on every schedule start: duplicate, contained, overlapping, or directly adjacent intervals of the **same mode** are collapsed into one union interval before old entries are trimmed. This makes schedule-watchdog/reconciliation re-entry idempotent and prevents a long uninterrupted Self-Consumption period from consuming one history entry every 15 minutes.
+
 The Inverter card’s **Sub Mode** dropdown is a command selector. It returns to `-` immediately after a selection. The separate status display shows the actual active sub-mode, or the inverter’s native working mode when no valid sub-mode is active.
 
 ## Required integrations and entities
@@ -408,6 +471,7 @@ The Solax/Solinteg integration and official register descriptions may use names 
 | Purpose | Current entity ID |
 |---|---|
 | Planner price series | `sensor.nordpool_kwh_se3_sek_0_200000_0` |
+| Unagi next-day dashboard preview only | `sensor.unagi_se3` |
 | Exact import price (SEK/kWh) | `sensor.nordpool_kwh_se3_sek_4_10_025` |
 | Exact export price (SEK/kWh) | `sensor.nordpool_kwh_se3_sek_5_00_0` |
 | Solcast today | `sensor.solcast_pv_forecast_forecast_today` |
@@ -415,6 +479,8 @@ The Solax/Solinteg integration and official register descriptions may use names 
 | Solcast remaining today | `sensor.solcast_pv_forecast_forecast_remaining_today` |
 
 The Solcast forecast entities must expose a `detailedForecast` attribute containing period start times and PV estimates.
+
+`sensor.unagi_se3` is intentionally **not** a planner input. The Plotly card uses its native hourly `raw_tomorrow` values only while the Nord Pool planner-price sensor does not have valid tomorrow data. Unagi values are SEK/kWh and are multiplied by 100 only for the dashboard's öre/kWh display. The hourly periods are rendered as one-hour forecast bars rather than being expanded into artificial 15-minute prices. For the visual trace, the card deliberately declares the same Nord Pool entity as the real price trace so Plotly Graph Card assigns both traces to the same automatic price-axis/unit group; the custom `$fn` x/y/width/color data still comes from `sensor.unagi_se3`. This avoids the explicit `yaxis` override that Home Assistant rejected in the previous attempted revision. Unagi remains zero-based and the card uses overlay bar mode. Unagi bars use 99% of their one-hour interval plus a dark outline, leaving only a very small visual gap between hourly forecast bars. While those Unagi-only bars are visible, the Plotly **Solar** trace and average-consumption/**Drain** trace are extended across the same visual horizon so tomorrow is not shown as price-only. This extension is display-only: pSOC, schedule simulation, and all planner calculations remain bounded by actual Nord Pool data. As soon as actual Nord Pool tomorrow prices become valid, the Unagi preview disappears and the visual overlays naturally use the real Nord Pool horizon.
 
 ## Documentation acknowledgements
 
