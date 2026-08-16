@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.12.15.03`
-- Dashboard: `v2026.08.12.15.03`
+- Scheduler: `v2026.08.16.14.36`
+- Dashboard: `v2026.08.12.15.18`
 
 The tested system uses:
 
@@ -229,7 +229,7 @@ The planner uses a rolling look-ahead window, normally up to 48 hours. It combin
 - Minimum profitable price spread
 - Battery SOC limits and sell buffer
 - A measured time-of-day household load profile
-- Manual schedules that must not be overwritten
+- Manual schedules that must not be overwritten and whose forecast battery effect is included in the planning energy budget
 
 ### Household load model
 
@@ -267,7 +267,7 @@ Automatic grid-charge power is reduced only by the existing partial-final-slot l
 The exact implementation is extensive, but the decision flow is broadly:
 
 1. **Read inputs and project SOC** to the next 15-minute boundary.
-2. **Protect manual and currently running periods.**
+2. **Protect manual and currently running periods**, while including manual-slot charge/discharge/SOC effects in the chronological energy budget.
 3. **Select charging periods** where low prices can economically offset later expensive consumption.
 4. **Consolidate periods** to reduce mode changes and fragmented schedules.
 5. **Allocate expensive periods** for battery-backed self-consumption.
@@ -275,6 +275,32 @@ The exact implementation is extensive, but the decision flow is broadly:
 7. **Create morning Feed-In periods** when export prices are attractive and enough solar/time remains to recharge safely.
 8. **Fill all remaining periods** using the projected energy balance.
 9. **Commit the final schedule once**, changing only helpers whose values actually differ.
+
+### Manual-slot budgeting
+
+Manual schedule slots **01–05 remain protected**: automatic planning never overwrites them or places an automatic charge/Self-Consumption/Sell period on top of them. Their energy effect is no longer ignored, however.
+
+The dashboard pSOC trace already evaluates every enabled schedule slot from **01 through 40**, so manual slots were already visible in the plotted SOC forecast. The planner previously behaved differently: it marked 01–05 as occupied but several internal budget/SOC simulations treated those periods as generic background Self-Consumption. That could make the automatic battery budget too optimistic after a manual discharge, or fail to make use of energy added by a manual charge.
+
+The planner now applies the real configured manual mode chronologically in its budget simulations:
+
+- **qEMS Battery Charge:** minimum requested charge, increased when forecast PV surplus is larger, capped by qEMS Maximum Target and learned acceptance for prediction.
+- **qEMS Battery Discharge:** requested discharge is a floor; forecast house demand after PV may require more.
+- **qEMS PV Charge:** forecast PV charges the battery while the house is supplied from grid.
+- **qEMS PV Charge+House:** only forecast PV surplus charges the battery.
+- **qEMS Feed-In:** PV is exported while the battery supplies forecast PV deficit.
+- **qEMS Battery Freeze:** no battery movement.
+- **Self-Consumption / qEMS Self-Consumption:** normal PV-first battery balancing.
+
+These manual periods now affect full-coverage testing, causal SOC safety, automatic energy allocation, partial-charge verification, final projected SOC, and the Step 2.5 Self-Consumption-duration simulation. Manual periods still do **not** count as automatically selected Self-Consumption hours.
+
+There is also a separate rolling **Sell energy budget**. Scheduler `v2026.08.13.19.48` did not fully cover that path: manual timestamps were blocked from auto Sell placement, but manual Battery Discharge energy was not deducted from the Sell-specific budget. That meant an auto Sell period could simply move elsewhere when a user created a manual Sell period.
+
+As of `v2026.08.14.13.35`, every future manual **qEMS Battery Discharge** quarter-hour inside the current active Sell/refill cycle explicitly reserves `min(requested power, qEMS Max Target) × 0.25 h` from the same Sell budget used by automatic Sell. Automatic Sell receives only the remainder, never less than zero, and the post-Sell refill-safety simulation includes the same manual reservation. Manual Sell periods themselves remain protected and are never moved or overwritten.
+
+Late Charge and Late Sell use persistent immutable economic anchors so repeated 15-minute replans cannot repeatedly spend the configured acceptance margin. Those anchors are only valid for the protected-slot topology that existed when they were created. As of `v2026.08.14.14.24`, creating, editing, moving/resizing, or deleting a manual slot 01–05 of type **qEMS Battery Charge** or **qEMS Battery Discharge** clears both Late Charge and Late Sell anchor families (for both Auto Charge and Auto Inverter cards). The next replan therefore rebuilds fresh anchors against the new manual-slot layout instead of being pulled toward stale destinations/prices.
+
+Example: if the gross automatic Sell budget is 4.125 kWh (one 10 kW quarter-hour plus one 6.5 kW quarter-hour) and the user creates two manual 10 kW quarter-hours, the manual reservation is 5.0 kWh and the remaining automatic Sell budget becomes 0 kWh.
 
 ### Charging
 
@@ -339,6 +365,8 @@ average morning Feed-In price
 PV quantity still determines physical feasibility, SOC, recharge time, learned charge acceptance, and which later periods are genuinely displaced. It does **not** weight the price comparison. For example, selling 1 kWh at 30 öre is considered a better timing opportunity than later selling 2 kWh at 20 öre when the configured price advantage allows it; the larger later energy volume no longer wins merely because its total revenue is larger.
 
 A setting of **0 Öre/kWh** allows equal average prices. After a Feed-In block has started, a weak 15-minute extension can remain provisional for up to one hour so following higher-price periods can rescue the equal-weighted average. If that one-hour extension still does not meet the configured price advantage, Feed-In ends before the first weak period.
+
+As of `v2026.08.16.14.36`, the Feed-In evaluator no longer accumulates or reports separate morning-export and later-displaced kWh totals. Those quantities are redundant for the price-only decision once the candidate successfully catches back up to the same recharge target. The planner still runs the baseline and candidate SOC trajectories because they are required for minimum-SOC/recharge safety and to identify **which** later slots genuinely contain displaced export; only the unnecessary shifted-energy totals were removed.
 
 ### Final gap fill
 
