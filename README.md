@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.16.14.36`
-- Dashboard: `v2026.08.12.15.18`
+- Scheduler: `v2026.08.17.13.12`
+- Dashboard: `v2026.08.17.13.12`
 
 The tested system uses:
 
@@ -211,7 +211,7 @@ The estimator is anchored automatically only at a verified full-charge endpoint.
 stored charge = measured charge × (1 - Shadow Charge Loss / 100)
 ```
 
-This setting is intentionally independent of the planner's charge/discharge or round-trip efficiency assumptions. It applies only to Shadow SOC charge accumulation; measured discharge energy is unchanged. Because the correction is applied when Shadow SOC is calculated rather than destructively written into the accumulated charge counter, changing the slider also recalculates the charge movement already accumulated since the current Shadow anchor.
+This setting remains independent of the planner's **Cycle Efficiency** economic assumption. As of `v2026.08.17.13.12`, however, the same empirical storage factor is deliberately shared by **Shadow SOC, planner physical SOC simulation, and Plotly pSOC**. Accepted charging energy is multiplied by `1 - Shadow Charge Loss / 100` before it becomes predicted stored battery energy; discharge energy remains unchanged everywhere. Because the Shadow estimator applies the correction at calculation time rather than destructively altering accumulated counters, changing the slider still recalculates the charge movement accumulated since the current Shadow anchor, and future pSOC/planner projections immediately use the same new factor.
 
 To avoid hiding calibration error, raw Shadow SOC is never clamped. If raw Shadow SOC is above 100% when genuine discharge begins, YOUEMS latches the excess above 100% as a persistent **top correction**. Operational Shadow SOC then subtracts that correction before applying the physical 0–100% bounds. For example, if raw Shadow SOC is 102% when discharge starts, Operational Shadow SOC begins at 100%; when raw later reaches 90%, Operational Shadow SOC is 88%. This avoids a 2%-wide discharge dead zone while preserving the 102% raw value for diagnosis. The correction can only increase until the next trusted full/manual Shadow anchor, where it is cleared. The raw value immediately before a full anchor is retained as a diagnostic full-cycle error.
 
@@ -225,7 +225,8 @@ The planner uses a rolling look-ahead window, normally up to 48 hours. It combin
 - Solcast P50 or conservative P10/P50-derived PV forecasts
 - Current battery SOC and rated capacity
 - Configured charging power and target energy
-- Charge/discharge efficiency
+- **Cycle Efficiency** for economic/break-even calculations
+- **Shadow Charge Loss** for physical stored-charge/SOC calculations
 - Minimum profitable price spread
 - Battery SOC limits and sell buffer
 - A measured time-of-day household load profile
@@ -251,6 +252,10 @@ YOUEMS learns the battery/BMS charge-acceptance ceiling with **non-uniform SOC b
 - 85–100%: 1% buckets (`85, 86, …, 99`)
 
 This produces 38 buckets. The curve is used when predicting how much energy can actually enter the battery during grid charge, PV Charge, PV Charge+House, and solar-surplus charging. For scheduled Battery Charge, prediction now uses the larger of the scheduled minimum charge request and forecast PV surplus, capped at the qEMS maximum target, matching the runtime controller's PV-surplus capture behavior. Plotly pSOC uses the same rule and the same bucket map/learned acceptance model.
+
+As of `v2026.08.17.02.38`, charge-acceptance prediction is integrated **through every learned SOC bucket crossed inside the simulated interval** instead of applying the interval's starting bucket limit for the whole 15 minutes. This matters especially above about 90% SOC where the Force H3 taper changes rapidly. Each segment uses `min(requested power, learned bucket power)` until the next SOC-bucket boundary is reached, then the remaining time is simulated using the next bucket's limit. The same integration is used by the planner's charge/SOC simulations and Plotly pSOC; the learned curve remains prediction-only and never throttles the real qEMS target.
+
+As of `v2026.08.17.13.12`, crossing time and stored-energy gain also include the empirical Shadow charge-loss factor. The physical prediction chain is therefore `requested/available power → learned BMS acceptance → Shadow charge-storage factor → stored kWh / pSOC`. For example, with Shadow Charge Loss = 2.6%, 10.0 kW accepted for a full 15-minute interval below the taper stores `10 × 0.25 × 0.974 = 2.435 kWh`, not 2.500 kWh. Cycle Efficiency is no longer used as a physical SOC-storage factor; it remains an economic parameter for price thresholds/shadow pricing.
 
 To avoid learning temporary BMS restrictions or unusually high limits after shallow/partial cycles, charge-acceptance learning now requires a **qualified deep-charge session**. A session arms only when genuine battery charging is seen at or below **50% Operational Shadow SOC**. Once armed, YOUEMS may learn continuously on the upward charge through the higher SOC buckets. The session is discarded at full (>=99.9%), if Operational Shadow SOC falls at least 1.0 percentage point from the session peak, or if genuine charging is absent for five minutes. Home Assistant restart also starts disarmed, so an upper-SOC charge already in progress after restart is not treated as a qualified learning cycle. Brief pauses below five minutes are tolerated. The existing learned curve is not reset by this change.
 
@@ -455,7 +460,7 @@ The only custom Lovelace card currently required by the supplied dashboard is:
 
 - **Plotly Graph Card** (`custom:plotly-graph`)
 
-The Plotly projected-SOC trace uses a fixed **0–100% pSOC scale** and keeps full internal SOC precision instead of rounding plotted points to whole percentages. Hover text shows pSOC with one decimal. While the simulated battery is charging, its hover text also shows the charge-acceptance ceiling for that SOC bucket, for example `94.3% pSOC (⚡≤4.4 kW)`. A trailing `*` means the bucket is not learned and the display is showing the configured maximum-target assumption; the prediction itself continues to assume the full requested/available charging power can be absorbed for an unlearned bucket.
+The Plotly projected-SOC trace uses a fixed **0–100% pSOC scale** and keeps full internal SOC precision instead of rounding plotted points to whole percentages. Hover text shows pSOC with one decimal and, when the simulated battery moves materially during that interval, a compact signed **stored battery-energy** value: for example `70.6% pSOC (🔋 +1.32kWh)` while charging or `(🔋 -1.27kWh)` while discharging. Effectively idle intervals omit the parenthesis. The value is the net pSOC battery movement for that plotted interval (normally 15 minutes; for the current slot it is the remaining fraction), after learned charge acceptance and Shadow Charge Loss have been applied. The same helper format is used over both real Nord Pool and Unagi-only pSOC continuation.
 
 The thin Plotly history strip is backed by `input_text.schedule_history`, a compact newest-first interval stream encoded as `15-minute-index|period-count|mode-code`. Because Home Assistant `input_text` is limited to 255 characters, the writer normalizes the complete stream on every schedule start: duplicate, contained, overlapping, or directly adjacent intervals of the **same mode** are collapsed into one union interval before old entries are trimmed. This makes schedule-watchdog/reconciliation re-entry idempotent and prevents a long uninterrupted Self-Consumption period from consuming one history entry every 15 minutes.
 
@@ -508,7 +513,7 @@ The Solax/Solinteg integration and official register descriptions may use names 
 
 The Solcast forecast entities must expose a `detailedForecast` attribute containing period start times and PV estimates.
 
-`sensor.unagi_se3` is intentionally **not** a planner input. The Plotly card uses its native hourly `raw_tomorrow` values only while the Nord Pool planner-price sensor does not have valid tomorrow data. Unagi values are SEK/kWh and are multiplied by 100 only for the dashboard's öre/kWh display. The hourly periods are rendered as one-hour forecast bars rather than being expanded into artificial 15-minute prices. For the visual trace, the card deliberately declares the same Nord Pool entity as the real price trace so Plotly Graph Card assigns both traces to the same automatic price-axis/unit group; the custom `$fn` x/y/width/color data still comes from `sensor.unagi_se3`. This avoids the explicit `yaxis` override that Home Assistant rejected in the previous attempted revision. Unagi remains zero-based and the card uses overlay bar mode. Unagi bars use 99% of their one-hour interval plus a dark outline, leaving only a very small visual gap between hourly forecast bars. While those Unagi-only bars are visible, the Plotly **Solar** trace and average-consumption/**Drain** trace are extended across the same visual horizon so tomorrow is not shown as price-only. This extension is display-only: pSOC, schedule simulation, and all planner calculations remain bounded by actual Nord Pool data. As soon as actual Nord Pool tomorrow prices become valid, the Unagi preview disappears and the visual overlays naturally use the real Nord Pool horizon.
+`sensor.unagi_se3` is intentionally **not** a planner input. The Plotly card uses its native hourly `raw_tomorrow` values only while the Nord Pool planner-price sensor does not have valid tomorrow data. Unagi values are SEK/kWh and are multiplied by 100 only for the dashboard's öre/kWh display. The hourly periods are rendered as one-hour forecast bars rather than being expanded into artificial 15-minute prices. For the visual trace, the card deliberately declares the same Nord Pool entity as the real price trace so Plotly Graph Card assigns both traces to the same automatic price-axis/unit group; the custom `$fn` x/y/width/color data still comes from `sensor.unagi_se3`. This avoids the explicit `yaxis` override that Home Assistant rejected in the previous attempted revision. Unagi remains zero-based and the card uses overlay bar mode. Unagi bars use 99% of their one-hour interval plus a dark outline, leaving only a very small visual gap between hourly forecast bars. While those Unagi-only bars are visible, Plotly **Solar**, average-consumption/**Drain**, and **pSOC** extend across the same visual horizon (still capped at 48 hours). Beyond the last real Nord Pool slot, pSOC is a display-only continuation based solely on Solcast solar plus the learned house-consumption profile in ordinary solar-first Self-Consumption; Unagi price values, automatic schedules, Late logic, and planner economics are not used. As soon as actual Nord Pool tomorrow prices become valid, the Unagi preview disappears and pSOC/visual overlays naturally use the real Nord Pool horizon.
 
 ## Documentation acknowledgements
 
