@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.18.17.02`
-- Dashboard: `v2026.08.18.17.02`
+- Scheduler: `v2026.08.18.23.55`
+- Dashboard: `v2026.08.18.23.20`
 
 The tested system uses:
 
@@ -33,12 +33,12 @@ The tested system uses:
 
 ### Safe rollback baseline
 
-Immediately before the Feed-In average-price redesign, the user explicitly selected this pair as the new safe rollback/regression baseline:
+The user explicitly selected this pair as the current last-safe rollback/regression baseline on 2026-08-18:
 
-- Scheduler: `v2026.08.11.15.35`
-- Dashboard: `v2026.08.12.00.23`
+- Scheduler: `v2026.08.17.13.12`
+- Dashboard: `v2026.08.18.13.40`
 
-Keep those files available when diagnosing later planner regressions.
+Keep those files available when diagnosing later planner or dashboard regressions.
 
 ## What YOUEMS does
 
@@ -108,7 +108,7 @@ All qEMS modes use `EMS BattCtrl`. Home Assistant calculates or maintains the ba
 | **qEMS PV Charge+House** | PV supplies the house first and only remaining PV charges the battery. Battery discharge is prevented and grid charging of the battery is blocked. This is normally preferable when the goal is to avoid importing house load merely to prioritize battery charging. |
 | **qEMS Battery Charge** | Charges at least the requested battery power, but automatically increases charging to absorb a larger PV surplus instead of exporting it. Grid charging is allowed for the requested shortfall. |
 | **qEMS Battery Discharge** | Discharges at least the requested power while also covering higher household demand when needed. |
-| **qEMS Battery Freeze** | Requests zero battery power and blocks both inverter AC directions. It is intended primarily for no-solar periods where the grid should supply the house and the battery must remain untouched. |
+| **qEMS Battery Freeze** | Requests zero battery power and blocks inverter AC **input** while leaving inverter AC output open. PV therefore remains free to supply the house/export while the battery is held at zero. The qEMS Export Negative Price Guard may independently restrict output when active. |
 
 All seven qEMS modes have been tested on the reference installation.
 
@@ -199,6 +199,20 @@ When the requested qEMS sub-mode is already active, YOUEMS preserves the live ta
 - A remembered qEMS sub-mode is considered valid only while the inverter is actually in `EMS BattCtrl`.
 - No battery charge-current or discharge-current registers are changed by YOUEMS.
 
+### qEMS Battery Freeze output semantics
+
+Testing on the reference installation confirmed that Battery Freeze does **not** need a zero inverter-output limit to hold the battery still. The current profile therefore uses:
+
+```text
+BattCtrl target (50207) = 0 kW
+Max inverter AC input (50209) = 0 kW
+Max inverter AC output (50208) = open / 200 kW
+```
+
+This keeps measured battery power at approximately zero while allowing available PV to serve the house and export normally. If qEMS Export Negative Price Guard is active at the same time, that separate controller may dynamically reduce 50208.
+
+This distinction is useful for PV-availability learning because Battery Freeze by itself is no longer an artificial PV-curtailment condition.
+
 ## qEMS Export Negative Price Guard
 
 The optional **qEMS Export Negative Price Guard** prevents unwanted PV export whenever the fee-inclusive Nord Pool **sell price is negative**. It no longer uses configurable Öre thresholds or an export-confirmation timer:
@@ -229,7 +243,7 @@ The dynamic controller:
 
 - runs against 50208 while the inverter is in either **EMS General** or **EMS BattCtrl**;
 - never changes Working Mode just to limit export;
-- preserves qEMS Battery Freeze's stronger 0 kW output limit;
+- coexists with qEMS Battery Freeze: Freeze holds battery target and inverter AC input at 0, while the negative-price guard independently owns any required 50208 output restriction;
 - reuses the existing qEMS **Controller Interval**, **Post-Write Settling**, **Grid Deadband**, and **Minimum Target Change** settings;
 - uses the same qEMS sensor-freshness philosophy and holds the existing cap while required PV/battery/grid feedback is stale;
 - keeps a separate `qems_last_output_limit_write` timestamp so 50208 settling cannot starve the independent 50207 battery-target loop, and vice versa;
@@ -296,6 +310,61 @@ The planner uses a rolling look-ahead window, normally up to 48 hours. It combin
 - Battery SOC limits and sell buffer
 - A measured time-of-day household load profile
 - Manual schedules that must not be overwritten and whose forecast battery effect is included in the planning energy budget
+
+### PV Forecast Adaptation
+
+Winter snow, frost, persistent obstruction, or a degraded PV string can make the physical array produce far less than Solcast predicts. Optional **PV Forecast Adaptation** learns a persistent **PV Availability** factor from actual uncurtailed production and applies that factor to the planner's physical solar assumptions.
+
+User controls:
+
+- **PV Forecast Adaptation** — Off means the effective factor is exactly 100% and YOUEMS trusts Solcast as before. Learning is paused but the stored learned factor is retained.
+- **PV Shortfall Response** — default 50%; controls how strongly a credible low-production observation pulls availability downward.
+- **PV Recovery Response** — default 40%; controls how quickly availability recovers when production demonstrates that the array can again deliver more.
+
+The learner evaluates completed **30-minute Solcast periods**. Actual PV energy is integrated from `sensor.solax_inverter_pv_power_total` into `sensor.youems_pv_learning_energy`, avoiding dependence on a coarse daily energy counter.
+
+For a clean period:
+
+```text
+observed availability = actual PV energy / raw Solcast P50 energy
+```
+
+The ratio is capped to 0–100%. Downward learning is deliberately gated by **P10**: ordinary production below P50 does not reduce availability if actual generation is still within the P10 weather envelope. A period also needs at least 0.25 kWh of P50 opportunity before it can teach the learner.
+
+Updates use asymmetric user-controlled response:
+
+```text
+shortfall: new = old + Shortfall Response × (observed - old)
+recovery:  new = old + Recovery Response  × (observed - old)
+```
+
+With the defaults, 100% availability followed by a credible 10% observation becomes 55%; another equivalent observation becomes 32.5%. Recovery from 20% toward an 80% observation becomes 44%.
+
+#### Curtailment protection
+
+YOUEMS must never interpret its own PV curtailment as snow or array degradation. The Solinteg integration exposes diagnostic **Inverter Operation Flags** from register 10110. A complete 30-minute learning period is rejected if:
+
+- **`PV PLim`** appears at any time; or
+- **`EMS CmdLim`** appears while EMS maximum inverter AC output (50208) is actually restrictive rather than open.
+
+The invalid-period latch is sticky until the next 30-minute boundary, so even a brief curtailment event prevents that period from training the availability factor. The exact installed entity is `sensor.solax_inverter_inverter_operation_flags`. Its normal **no-flags** state is an empty string, which is valid learning data; examples of active states are `EMS CmdLim`, `PV PLim`, and comma-separated `EMS CmdLim,PV PLim`. Only `unknown` or `unavailable` are treated as missing operation-flag data and make learning fail safe.
+
+This protects learning during qEMS Export Negative Price Guard operation: if that controller actually reaches an EMS/PV limit, the period is discarded rather than being mistaken for poor physical PV availability.
+
+#### Planner and dashboard use
+
+PV Availability is a **physical array-capability correction**, separate from Forecast Bias and the existing P50 versus P10/P50 conservative forecast choices:
+
+```text
+Solcast forecast basis
+→ existing Forecast Bias / conservative choice
+→ PV Availability factor
+→ planner stored-energy / refill / Sell / Feed-In / pSOC simulation
+```
+
+The factor is applied across future physical solar assumptions, including recharge safety and Sell/Feed-In solar budgets. The Plotly **Solar** trace intentionally remains raw Solcast so the difference between weather forecast and learned physical availability remains visible; Plotly **pSOC** uses the effective derated solar.
+
+The factor persists overnight, which is intentional for snow cover. It changes only when later clean, sufficiently sunny observations provide new evidence.
 
 ### Household load model
 
@@ -519,6 +588,7 @@ Do not disable Dry Run until the generated notification and dashboard schedule m
 - Feed-In and Sell controls
 - qEMS tuning and diagnostics
 - qEMS Export Negative Price Guard using dynamic EMS output limiting
+- PV Forecast Adaptation controls and learned PV Availability diagnostics
 - Savings estimates
 - Optional shadow-scan controls
 
@@ -557,6 +627,9 @@ The Solax/Solinteg integration and official register descriptions may use names 
 | Grid power | `sensor.solax_inverter_meter_active_power` |
 | Battery power | `sensor.solax_inverter_battery_power` |
 | PV power | `sensor.solax_inverter_pv_power_total` |
+| Inverter operation flags | `sensor.solax_inverter_inverter_operation_flags` |
+| PV-learning integrated energy | `sensor.youems_pv_learning_energy` |
+| Effective PV availability | `sensor.youems_pv_availability` |
 | Decimal planner SOC | `sensor.force_h3_battery_percent` |
 | Inverter SOC (runtime safety guard) | `sensor.solax_inverter_battery_soc` |
 | Battery rated capacity | `sensor.solax_inverter_battery_rated_capacity` |
