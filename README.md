@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.17.13.12`
-- Dashboard: `v2026.08.17.13.12`
+- Scheduler: `v2026.08.18.17.02`
+- Dashboard: `v2026.08.18.17.02`
 
 The tested system uses:
 
@@ -183,7 +183,7 @@ When entering `EMS BattCtrl`, YOUEMS always changes the inverter working mode fi
 
 This order matters because BattCtrl parameters written before the working-mode change may be stored/read back but still not be enforced by the inverter. **Register readback is therefore not proof that a pre-mode write took effect.** YOUEMS always enters and confirms `EMS BattCtrl` first, then writes the complete priority/limit/target set.
 
-When qEMS is not active, working-mode changes also reassert unrestricted EMS AC limits, so restrictive settings left by a previous qEMS profile are not intentionally carried into another inverter mode. The inverter's actual working mode remains authoritative: if it is changed externally while a schedule is already running, qEMS stops rather than fighting the external change.
+When qEMS is not active, working-mode changes normally reassert unrestricted EMS AC limits so restrictive settings left by a previous qEMS profile are not carried into another inverter mode. The one deliberate exception is the **negative-price export guard**: while it is active, the managed 50208 output cap is retained even in native `EMS General`. The inverter's actual working mode remains authoritative: if it is changed externally while a schedule is already running, qEMS stops rather than fighting the external change.
 
 When the requested qEMS sub-mode is already active, YOUEMS preserves the live target and performs no initialization writes. This prevents a schedule boundary from momentarily resetting a battery that is charging or discharging at high power.
 
@@ -199,19 +199,84 @@ When the requested qEMS sub-mode is already active, YOUEMS preserves the live ta
 - A remembered qEMS sub-mode is considered valid only while the inverter is actually in `EMS BattCtrl`.
 - No battery charge-current or discharge-current registers are changed by YOUEMS.
 
+## qEMS Export Negative Price Guard
+
+The optional **qEMS Export Negative Price Guard** prevents unwanted PV export whenever the fee-inclusive Nord Pool **sell price is negative**. It no longer uses configurable Öre thresholds or an export-confirmation timer:
+
+```text
+Guard enabled + sell price < 0   -> Active immediately
+Guard enabled + sell price >= 0  -> Armed/released immediately
+```
+
+Current site export is deliberately **not** a prerequisite. The guard is applied as soon as the sell price becomes negative, so it can prevent the first costly export rather than waiting until export has already been observed. Plotly uses the exact same `< 0` sell-price rule for its red negative-price bars.
+
+The guard no longer uses the inverter's persistent `Export Limit` switch/percentage during normal operation. Those legacy settings are treated as EEPROM-style configuration and are intentionally removed from the fast control path.
+
+Instead, YOUEMS uses EMS register **50208**, the observed **Maximum Inverter AC Output** control. The user configures only the allowed site-export buffer as a percentage; on the reference MHT-10K-25 installation, `10% = 1.0 kW` allowed site export and `0% = 0.0 kW`.
+
+A crucial distinction is that 50208 does **not** directly represent utility-meter/site export. It limits the inverter's own positive AC output. Therefore YOUEMS calculates:
+
+```text
+house load = PV + battery - grid
+dynamic 50208 cap = house load + allowed site export
+```
+
+where native Solinteg grid sign is positive export and battery sign is positive discharge / negative charge.
+
+Battery charging is **not added again** to the limit. When the battery is charging, negative battery power already reduces inverter AC output; adding charge power separately would allow too much grid export. Example: PV 8 kW, battery charging 5 kW, site exporting 1 kW implies house load 2 kW. With a 1 kW export buffer, the correct inverter-output cap is `2 + 1 = 3 kW`, not 8 kW.
+
+The dynamic controller:
+
+- runs against 50208 while the inverter is in either **EMS General** or **EMS BattCtrl**;
+- never changes Working Mode just to limit export;
+- preserves qEMS Battery Freeze's stronger 0 kW output limit;
+- reuses the existing qEMS **Controller Interval**, **Post-Write Settling**, **Grid Deadband**, and **Minimum Target Change** settings;
+- uses the same qEMS sensor-freshness philosophy and holds the existing cap while required PV/battery/grid feedback is stale;
+- keeps a separate `qems_last_output_limit_write` timestamp so 50208 settling cannot starve the independent 50207 battery-target loop, and vice versa;
+- deliberately does **not** use qEMS Maximum Target Step for 50208: export tightening and house-load headroom should respond promptly;
+- releases back to the normal qEMS output limit immediately when the sell price is no longer negative or the feature is disabled;
+- respects Dry Run.
+
+The reference installation has verified that 50208 is enforced in `EMS General`, which allows native Self-Consumption to continue while YOUEMS trims inverter output.
+
+### Expected inverter status indications while limiting
+
+While the guard is actively restricting inverter output, the inverter may report **`EMS CmdLim`**, **`PV PLim`**, or both. This is expected behavior rather than a fault:
+
+- **EMS CmdLim** indicates that the requested inverter power is being constrained by an EMS limit.
+- **PV PLim** indicates that PV production is being curtailed because the permitted inverter output has been reached.
+
+These indications may appear especially when available PV exceeds `house load + allowed export`, because 50208 is intentionally forcing the inverter/MPPT system to reduce positive AC output.
+
+A one-time migration helper disables the old persistent inverter Export Limit **switch** if it is still on, then records that migration. The old export-limit percentage is left untouched and YOUEMS never writes either legacy setting again during normal control.
+
 ## Shadow SOC estimator
 
 YOUEMS keeps two Shadow SOC values. **Raw Shadow SOC** (`sensor.youems_shadow_battery_soc`) is deliberately unbounded and remains a diagnostic/calibration value: it may go below 0% or above 100% so accumulated measurement error remains visible. **Operational Shadow SOC** (`sensor.youems_operational_shadow_soc`) is the physically guarded 0–100% value used by the planner and by charge-acceptance bucket selection.
 
 The estimator is anchored automatically only at a verified full-charge endpoint. During a continuous charge it arms when either SOC source reaches the high-SOC region (>=95%) while charge direction and BMS charge permission still indicate charging; a one-minute watchdog provides the same recovery if the exact crossing event is missed. When BMS maximum charge current subsequently transitions to zero after measurable charge movement, the endpoint is anchored as exactly 100%. There is deliberately no automatic low-SOC anchor. Manual re-sync controls remain available for diagnostics and recovery.
 
-`input_number.youems_shadow_charge_loss_pct` is a separate Shadow-SOC measurement correction, adjustable from **0.0 to 5.0% in 0.1% steps**. It reduces measured charge energy before treating it as newly stored battery energy:
+**Charge Loss** is now an automatically learned physical battery parameter. The internal persisted estimate remains bounded to **0–5%**, but is stored at **0.001% resolution** and is no longer exposed as an editable dashboard slider. The read-only `sensor.youems_charge_loss` is the common value used by Shadow SOC, planner physical SOC, and Plotly pSOC.
+
+Before YOUEMS has one qualified learning cycle, the sensor deliberately reports **2.500%**. No `initial:` value is forced into the persisted helper; the 2.5% value is a fallback until automatic learning has trustworthy data.
+
+The physical rule remains:
 
 ```text
-stored charge = measured charge × (1 - Shadow Charge Loss / 100)
+stored charge = measured/accepted charge × (1 - Charge Loss / 100)
 ```
 
-This setting remains independent of the planner's **Cycle Efficiency** economic assumption. As of `v2026.08.17.13.12`, however, the same empirical storage factor is deliberately shared by **Shadow SOC, planner physical SOC simulation, and Plotly pSOC**. Accepted charging energy is multiplied by `1 - Shadow Charge Loss / 100` before it becomes predicted stored battery energy; discharge energy remains unchanged everywhere. Because the Shadow estimator applies the correction at calculation time rather than destructively altering accumulated counters, changing the slider still recalculates the charge movement accumulated since the current Shadow anchor, and future pSOC/planner projections immediately use the same new factor.
+Learning occurs only at an **automatic verified BMS full-charge endpoint** when the previous Shadow anchor was also a reliable full anchor. For a full-to-full interval, Shadow SOC treats discharge energy as exact and solves the observed charge-side loss from the stitched counters:
+
+```text
+observed Charge Loss = 100 × (1 - discharged kWh / charged kWh)
+```
+
+This intentionally does **not** use the BMS remaining-capacity change between the two full anchors, so BMS capacity recalibration is kept separate from charge-loss learning. Shallow top-ups are rejected: the cycle must contain at least 20% of the previous full-anchor energy in measured charge, with a 2.0 kWh absolute minimum, and the resulting observation must lie inside 0–5%.
+
+The learner is a throughput-weighted running average rather than an exact replacement. The 2.5% fallback begins with an effective 10 kWh prior weight; each qualified cycle contributes up to 20 kWh; long-term history is capped at an effective 50 kWh so the estimate remains stable but can still adapt. For example, a first 10 kWh cycle observing 2.600% moves the learned value only to 2.550%, not directly to 2.600%.
+
+Charge Loss remains independent of the planner's **Cycle Efficiency** economic assumption. Accepted charging energy is reduced by Charge Loss before it advances stored SOC; discharge energy remains unchanged everywhere.
 
 To avoid hiding calibration error, raw Shadow SOC is never clamped. If raw Shadow SOC is above 100% when genuine discharge begins, YOUEMS latches the excess above 100% as a persistent **top correction**. Operational Shadow SOC then subtracts that correction before applying the physical 0–100% bounds. For example, if raw Shadow SOC is 102% when discharge starts, Operational Shadow SOC begins at 100%; when raw later reaches 90%, Operational Shadow SOC is 88%. This avoids a 2%-wide discharge dead zone while preserving the 102% raw value for diagnosis. The correction can only increase until the next trusted full/manual Shadow anchor, where it is cleared. The raw value immediately before a full anchor is retained as a diagnostic full-cycle error.
 
@@ -226,7 +291,7 @@ The planner uses a rolling look-ahead window, normally up to 48 hours. It combin
 - Current battery SOC and rated capacity
 - Configured charging power and target energy
 - **Cycle Efficiency** for economic/break-even calculations
-- **Shadow Charge Loss** for physical stored-charge/SOC calculations
+- automatically learned **Charge Loss** for physical stored-charge/SOC calculations
 - Minimum profitable price spread
 - Battery SOC limits and sell buffer
 - A measured time-of-day household load profile
@@ -255,7 +320,7 @@ This produces 38 buckets. The curve is used when predicting how much energy can 
 
 As of `v2026.08.17.02.38`, charge-acceptance prediction is integrated **through every learned SOC bucket crossed inside the simulated interval** instead of applying the interval's starting bucket limit for the whole 15 minutes. This matters especially above about 90% SOC where the Force H3 taper changes rapidly. Each segment uses `min(requested power, learned bucket power)` until the next SOC-bucket boundary is reached, then the remaining time is simulated using the next bucket's limit. The same integration is used by the planner's charge/SOC simulations and Plotly pSOC; the learned curve remains prediction-only and never throttles the real qEMS target.
 
-As of `v2026.08.17.13.12`, crossing time and stored-energy gain also include the empirical Shadow charge-loss factor. The physical prediction chain is therefore `requested/available power → learned BMS acceptance → Shadow charge-storage factor → stored kWh / pSOC`. For example, with Shadow Charge Loss = 2.6%, 10.0 kW accepted for a full 15-minute interval below the taper stores `10 × 0.25 × 0.974 = 2.435 kWh`, not 2.500 kWh. Cycle Efficiency is no longer used as a physical SOC-storage factor; it remains an economic parameter for price thresholds/shadow pricing.
+As of `v2026.08.17.13.12`, crossing time and stored-energy gain also include the empirical Charge Loss factor; as of `v2026.08.18.14.13` that factor is learned automatically at qualified full-to-full endpoints. The physical prediction chain is therefore `requested/available power → learned BMS acceptance → Shadow charge-storage factor → stored kWh / pSOC`. For example, with Shadow Charge Loss = 2.6%, 10.0 kW accepted for a full 15-minute interval below the taper stores `10 × 0.25 × 0.974 = 2.435 kWh`, not 2.500 kWh. Cycle Efficiency is no longer used as a physical SOC-storage factor; it remains an economic parameter for price thresholds/shadow pricing.
 
 To avoid learning temporary BMS restrictions or unusually high limits after shallow/partial cycles, charge-acceptance learning now requires a **qualified deep-charge session**. A session arms only when genuine battery charging is seen at or below **50% Operational Shadow SOC**. Once armed, YOUEMS may learn continuously on the upward charge through the higher SOC buckets. The session is discarded at full (>=99.9%), if Operational Shadow SOC falls at least 1.0 percentage point from the session peak, or if genuine charging is absent for five minutes. Home Assistant restart also starts disarmed, so an upper-SOC charge already in progress after restart is not treated as a qualified learning cycle. Brief pauses below five minutes are tolerated. The existing learned curve is not reset by this change.
 
@@ -263,7 +328,7 @@ The learned curve is **prediction-only**. It never reduces the qEMS Battery Char
 
 If the curve is not fully learned, an unlearned SOC bucket (stored as 0), or an invalid/missing curve, is treated as **no known restriction**: prediction assumes the full requested or currently available charging power can be absorbed. Learned values only reduce predicted acceptance where an actual positive value exists.
 
-The current package has no legacy 45→38 migration or startup recovery logic. The 38-value curve and 38-value sample-count stores are now the only supported format. A bucket whose sample count is zero treats its first valid observation as authoritative and replaces any stored seed immediately; after that, lower observations replace immediately and higher observations recover at 10% per sample. The manual **Reset Charge Acceptance Curve** control remains the explicit way to initialize or clear the stores.
+The current package has no legacy 45→38 migration or startup recovery logic. The 38-value curve and 38-value sample-count stores are now the only supported format. A bucket whose sample count is zero treats its first valid observation as authoritative. For an already learned bucket, the learner is intentionally asymmetric: a lower observation moves the bucket **45% toward the lower value**, while a higher observation moves it only **10% toward the higher value**. Normally only the first valid observation in each bucket may change the curve during one qualified deep-charge session. A second update is accepted only if the BMS charge-limit **current** has changed by at least 10% from the current used for the previous accepted update in that bucket. The comparison is against the last accepted-update current rather than the immediately previous 30-second sample, so gradual drift can still accumulate into a genuine material change. The manual **Reset Charge Acceptance Curve** control remains the explicit way to initialize or clear the stores.
 
 Automatic grid-charge power is reduced only by the existing partial-final-slot logic: when the remaining required energy can be delivered without a full-power slot, the final slot is commanded at the calculated partial power (subject to Minimum Charge Power). The learned acceptance ceiling may cause the planner to reserve additional charge slots, but does not itself lower their requested power.
 
@@ -453,6 +518,7 @@ Do not disable Dry Run until the generated notification and dashboard schedule m
 - Auto Inverter Scheduler
 - Feed-In and Sell controls
 - qEMS tuning and diagnostics
+- qEMS Export Negative Price Guard using dynamic EMS output limiting
 - Savings estimates
 - Optional shadow-scan controls
 
@@ -462,7 +528,7 @@ The only custom Lovelace card currently required by the supplied dashboard is:
 
 The Plotly projected-SOC trace uses a fixed **0–100% pSOC scale** and keeps full internal SOC precision instead of rounding plotted points to whole percentages. Hover text shows pSOC with one decimal and, when the simulated battery moves materially during that interval, a compact signed **stored battery-energy** value: for example `70.6% pSOC (🔋 +1.32kWh)` while charging or `(🔋 -1.27kWh)` while discharging. Effectively idle intervals omit the parenthesis. The value is the net pSOC battery movement for that plotted interval (normally 15 minutes; for the current slot it is the remaining fraction), after learned charge acceptance and Shadow Charge Loss have been applied. The same helper format is used over both real Nord Pool and Unagi-only pSOC continuation.
 
-The thin Plotly history strip is backed by `input_text.schedule_history`, a compact newest-first interval stream encoded as `15-minute-index|period-count|mode-code`. Because Home Assistant `input_text` is limited to 255 characters, the writer normalizes the complete stream on every schedule start: duplicate, contained, overlapping, or directly adjacent intervals of the **same mode** are collapsed into one union interval before old entries are trimmed. This makes schedule-watchdog/reconciliation re-entry idempotent and prevents a long uninterrupted Self-Consumption period from consuming one history entry every 15 minutes.
+Plotly schedule history is backed by `input_text.schedule_history`, a compact newest-first interval stream encoded as `15-minute-index|period-count|mode-code`. Past executed intervals are rendered with the same full-height mode colors and icons as future schedules, at slightly lower opacity, plus a solid thin history strip at the bottom. Historical annotations are icon-only and left-aligned at the beginning of each block. Because Home Assistant `input_text` is limited to 255 characters, the writer normalizes the complete stream on every schedule start: duplicate, contained, overlapping, or directly adjacent intervals of the **same mode** are collapsed into one union interval before old entries are trimmed. The blue NOW line remains, but its redundant current-price text annotation is intentionally omitted.
 
 The Inverter card’s **Sub Mode** dropdown is a command selector. It returns to `-` immediately after a selection. The separate status display shows the actual active sub-mode, or the inverter’s native working mode when no valid sub-mode is active.
 
