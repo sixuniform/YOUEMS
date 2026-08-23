@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.18.23.55`
-- Dashboard: `v2026.08.18.23.20`
+- Scheduler: `v2026.08.23.20.01`
+- Dashboard: `v2026.08.22.20.18`
 
 The tested system uses:
 
@@ -262,7 +262,82 @@ While the guard is actively restricting inverter output, the inverter may report
 
 These indications may appear especially when available PV exceeds `house load + allowed export`, because 50208 is intentionally forcing the inverter/MPPT system to reduce positive AC output.
 
-A one-time migration helper disables the old persistent inverter Export Limit **switch** if it is still on, then records that migration. The old export-limit percentage is left untouched and YOUEMS never writes either legacy setting again during normal control.
+The native/persistent inverter **Export Limit** feature is outside YOUEMS control and must be left **Off** when commissioning this controller. Current YOUEMS neither reads nor writes that EEPROM-style Export Limit switch/percentage; negative-price limiting is handled entirely through runtime EMS register 50208.
+
+## Sell replan boundary consistency
+
+The rolling Sell energy budget starts from the planner's already-projected **next 15-minute boundary SOC**. Sell gap/load simulation therefore begins at that exact quarter-hour.
+
+Earlier code projected SOC to the next quarter-hour, then started the Sell gap simulation at the next **30-minute** boundary because Solcast is 30-minute data. If the planner boundary was `:15` or `:45`, one 15-minute interval was silently omitted. This could make a marginal Sell slot disappear on a `:29`/`:59` automatic replan and reappear on a manual run just after `:30`/`:00`.
+
+Current behavior walks the Sell gap in **15-minute steps from `planner_next_slot_ts`**, using the enclosing 30-minute Solcast period's average kW for each half. The no-refill ten-hour reserve likewise uses 40×15-minute steps from the planner boundary. The later refill simulation remains 30-minute aligned.
+
+Late Sell anchors are intentionally preserved when current household use temporarily reduces the Sell energy budget; pending records outside the current allocation count remain stored until their destination passes.
+
+## BMS discharge-permission planning guard
+
+YOUEMS allows the configured **Planner Minimum SOC** to be below the Force H3's nominal 10% BMS SOC floor because Operational Shadow SOC and BMS SOC are independent estimates and can differ by several percentage points. Therefore the planner does **not** impose a permanent 10% sSOC minimum.
+
+At every (re)plan, YOUEMS reads `sensor.solax_inverter_battery_discharge_limit`. The existing qEMS runtime already refuses positive battery targets when this BMS current permission is near zero. The planner now uses the same signal:
+
+- discharge limit `> 0.05 A` -> normal planning with the user's selected minimum SOC;
+- discharge limit `<= 0.05 A` -> BMS discharge guard is active.
+
+While guarded, the Force/BMS 10% floor is translated into the current Operational Shadow SOC coordinate system:
+
+```text
+mapped sSOC floor = current Operational sSOC + (10% - current BMS SOC)
+```
+
+The temporary physical floor is the greater of that mapped floor and the **current sSOC**. The latter matters if the BMS has blocked discharge for some reason other than low SOC: the planner must not assume immediate battery use merely because the mapped 10% floor happens to be lower.
+
+The effective automatic-planner floor is then:
+
+```text
+effective planner floor = max(user Planner Minimum SOC, mapped BMS discharge floor)
+```
+
+This means a system at, for example, BMS SOC 10% / Operational sSOC 7% with zero discharge permission can still keep a 7% user setting. It simply plans **no further discharge at 7%**. Solar or grid charging may lift projected sSOC above that floor; later battery use can then be scheduled back down to the floor. On a subsequent real replan, the live BMS discharge-limit signal remains authoritative.
+
+The guard is applied to the automatic Self-Consumption/dispatch reserve, Sell planning, Feed-In safety, and the currently-running-slot SOC projection. Protected manual slots remain user-owned; actual qEMS battery targets are still independently blocked by the runtime BMS permission guard.
+
+Planner notifications show the live BMS discharge limit, BMS SOC, mapped sSOC floor, and any temporary effective planner floor.
+
+### Charge Loss cycle-contamination guard and rejected-attempt diagnostics
+
+Charge Loss learning now treats any declared inverter/Modbus communication fault during
+a full-to-full interval as contamination of that entire learning cycle.
+
+- `input_boolean.youems_shadow_charge_loss_cycle_contaminated` is latched when the
+  system communication watchdog declares a fault.
+- The latch deliberately survives communication recovery and HA restart.
+- At the next automatic `FULL LIMIT` anchor, the cycle is categorically rejected for
+  Charge Loss learning even if its final Q/D ratio happens to look plausible.
+- The new healthy anchor then clears the latch and starts a clean cycle.
+- A healthy manual anchor also starts a new clean interval and clears the latch.
+- `input_text.youems_shadow_charge_loss_last_attempt` records **every automatic full**
+  attempt, accepted or rejected, before the fine Q/D counters are reset.
+- The diagnostic includes previous anchor type/SOC, Q, D, observed loss and a concrete
+  rejection reason (communication contamination, untrusted previous anchor, shallow
+  cycle, observed loss below 0%, or observed loss above 5%).
+- `sensor.youems_charge_loss` exposes `last_attempt` and `cycle_contaminated` attributes.
+- `input_text.youems_shadow_charge_loss_last_update` remains the last **accepted**
+  learning event only.
+
+This avoids learning from a cycle that crossed an inverter/Modbus outage and makes a
+rejected full-to-full closure auditable instead of silently leaving the sample count
+unchanged.
+
+## Shadow SOC restart / inverter-communications resilience
+
+When stitched Force H3 fine-counter tracking is initialized, the Solinteg lifetime charge/discharge totals are **diagnostic only**. A temporary inverter-communications failure can briefly expose a numeric zero or stale lower lifetime total. That must not be interpreted as a physical counter reset and must not invalidate Shadow SOC.
+
+Current behavior:
+
+- while `input_boolean.youems_shadow_fine_counter_initialized` is ON, lower Solinteg lifetime totals are ignored for Shadow validity;
+- coarse lifetime-counter reset handling is used only when fine tracking is unavailable and the system is already operating in coarse fallback mode.
+
+This permanently prevents the false-reset failure seen after a transient Modbus/inverter dropout followed by a Home Assistant restart. No special one-time recovery path remains in normal code.
 
 ## Shadow SOC estimator
 
@@ -310,6 +385,90 @@ The planner uses a rolling look-ahead window, normally up to 48 hours. It combin
 - Battery SOC limits and sell buffer
 - A measured time-of-day household load profile
 - Manual schedules that must not be overwritten and whose forecast battery effect is included in the planning energy budget
+
+## Inverter communication watchdog
+### Degraded-communication operating-mode policy
+
+The SolaX integration's native
+`sensor.solinteg_inverter_communication_health` is part of the system watchdog, but its
+states are deliberately not treated equally. Real testing showed that SolaX can remain
+`Degraded` with `success_rate=100%` while grid/PV/battery telemetry is updating live
+every second. Therefore `Degraded`, `Quarantined` (and `unknown`/`unavailable`) are **advisory only**
+when telemetry remains fresh. `Quarantined` means the SolaX integration has stopped
+polling one or more registers it considers problematic; it is surfaced distinctly, but
+does not prove the entire inverter link is unusable. These states cannot by themselves
+force qEMS out of a running mode. Native `Offline` persisting for 120 seconds remains a
+hard fault source.
+The independent multi-entity `last_reported` watchdog remains the primary hard telemetry
+test. A proxy that serves cached reads can still make both ordinary entities and SolaX
+health look healthy; broker-side real-read health should therefore be added separately
+when the proxy exposes it.
+
+When the hard communication fault is active:
+
+- `qEMS Feed-In`, `qEMS Self-Consumption`, and `qEMS PV Charge+House` are considered
+  unsafe because their BattCtrl target depends on continuously fresh power feedback.
+  If one is running or requested, YOUEMS stops its feedback controller and makes one
+  forced switch to native `EMS General`.
+- `qEMS PV Charge`, `qEMS Battery Freeze`, `qEMS Battery Charge`, and
+  `qEMS Battery Discharge` may remain/start. PV Charge and Freeze keep their fixed
+  target. Battery Charge/Discharge are converted once to the user's requested static
+  ±kW target (removing any stale PV/load feedback uplift), then the one-second
+  controller performs no periodic writes until communication is healthy again.
+- Native `EMS General` is always acceptable.
+- The negative-price export limiter is disabled. If 50208 is restrictive, YOUEMS makes
+  one best-effort release to 200 kW. Economic export loss is preferred to repeatedly
+  manipulating 50208 from unreliable feedback.
+- Every communication-forced mode/output action is written to
+  `input_text.youems_inverter_communication_last_forced_action` and the HA system log.
+- If an active schedule was forced to the EMS General fallback, the active slot is
+  retained. After the normal 60-second healthy recovery confirmation, that schedule is
+  explicitly re-entered so its intended qEMS mode resumes.
+- `Restore Previous` post-behavior is replaced by `EMS General` while communication is
+  faulted; known safe explicit post-behaviors are still allowed.
+
+The quick status sensor preserves useful native advisory states:
+`Healthy`, `Recovering`, `Degraded`, `Quarantined`, `Unknown`, `Unavailable`, and
+pre-confirmation `Offline`; once the YOUEMS hard latch trips it reports `Fault`.
+`binary_sensor.youems_inverter_communication_fault` still trips only from confirmed hard
+evidence: native `Offline` for 120 seconds or the independent stale-telemetry rules.
+
+
+YOUEMS treats stale-but-still-numeric Modbus data as a first-class fault. This is
+important because Home Assistant can retain the last numeric state for hours even when
+the Solax/Modbus polling path has stopped, which previously allowed stale PV power to
+train PV Availability downward and allowed the planner to replan from old inverter data.
+
+The watchdog uses `last_reported`, not `last_updated`, because unchanged values can still
+be valid fresh reports. Normal observed reporting cadence is roughly 2 seconds for
+grid/battery/PV power and 5–7 seconds for SOC, voltage, limits, operation flags and mode.
+
+Current policy:
+
+- qEMS keeps its existing **30-second** dynamic-feedback stale-data safety pause.
+- A system communication fault is declared after **120 seconds** when at least 2 of the
+  3 core power heartbeats (grid, battery, PV) are stale/invalid, or at least 3 secondary
+  Modbus signals are stale/invalid.
+- A single PV-power channel stale for >120 seconds invalidates that full 30-minute
+  PV-learning period even if the global multi-signal fault threshold is not met.
+- Human alerts are sent at about **180 seconds total stale time** through Home Assistant
+  persistent notification plus the two configured `notify.send_message` targets.
+- Home Assistant startup has a **120-second grace**.
+- Recovery requires **60 seconds continuously healthy**.
+- During a fault, PV Availability keeps its last learned factor, PV learning is frozen,
+  automatic planning and schedule reconciliation are paused, new schedule/qEMS starts
+  are deferred, and qEMS/export-guard Modbus writes are blocked.
+- The existing schedule is preserved rather than cleared or replaced with a stale-data plan.
+- Recovery rebases the PV-learning energy snapshot and keeps the contaminated current
+  half-hour invalid; the next complete clean Solcast period can learn normally.
+- Recovery also rebases Savings Tracker cumulative-counter baselines so several hours of
+  catch-up energy are not incorrectly priced into one 15-minute slot.
+- If the automatic inverter scheduler is enabled, recovery immediately requests a fresh
+  replan from healthy data.
+
+Diagnostics are exposed as `sensor.youems_inverter_communication_status`,
+`binary_sensor.youems_inverter_communication_fault`, and
+`input_text.youems_inverter_communication_last_event`.
 
 ### PV Forecast Adaptation
 
@@ -699,6 +858,10 @@ Pay particular attention to:
 - Nord Pool area, currency, taxes, and fees
 - Solcast forecast entity names
 
+### First-install defaults
+
+YOUEMS uses persistent initialized markers for settings whose desired defaults are not the Home Assistant helper minimum. A normal **full Home Assistant restart after installing/updating the package** is the supported initialization path. At startup, one compact initializer applies only still-uninitialized defaults (qEMS tuning, planner reserve, Feed-In advantage, minimum charge power, Sell solar-surplus limit, and PV Forecast Adaptation response defaults). It does not continuously reconcile settings and never overwrites a group after its marker has been set.
+
 ### 4. Restart Home Assistant
 
 A full restart is recommended after installing the package so all helpers, scripts, template sensors, and automations are created together.
@@ -738,6 +901,10 @@ Use it to verify:
 - Clean stop and restoration of the previous inverter state
 
 The normal Inverter card and schedules do not require pressing a separate Start button; selecting or scheduling a qEMS mode activates it directly.
+
+## Clean-baseline maintenance
+
+The current package intentionally omits historical data-format converters and upgrade-only compatibility shims once the current format has become the baseline. In particular, there is no 45→38 charge-acceptance bucket converter, no old Late Charge/Sell price-only anchor converter, no `discharge_hours` service-data alias, and no recurring/hot-reload workaround for first-install defaults. Stable user-facing helper IDs are retained where changing them would lose settings or break existing dashboard references.
 
 ## Write minimization
 
