@@ -1,0 +1,37 @@
++- If an active schedule was forced to the EMS General fallback, the active slot is
++  retained. After the normal 60-second healthy recovery confirmation, that schedule is
++  explicitly re-entered so its intended qEMS mode resumes.
++- `Restore Previous` post-behavior is replaced by `EMS General` while communication is
++  faulted; known safe explicit post-behaviors are still allowed.
++
++The quick status sensor preserves useful native advisory states:
++`Healthy`, `Recovering`, `Degraded`, `Quarantined`, `Unknown`, `Unavailable`, and
++pre-confirmation `Offline`; once the YOUEMS hard latch trips it reports `Fault`.
++`binary_sensor.youems_inverter_communication_fault` still trips only from confirmed hard
++evidence: native `Offline` for 120 seconds or the independent stale-telemetry rules.
++
++
++YOUEMS treats stale-but-still-numeric Modbus data as a first-class fault. This is
++important because Home Assistant can retain the last numeric state for hours even when
++the Solax/Modbus polling path has stopped, which previously allowed stale PV power to
++train PV Availability downward and allowed the planner to replan from old inverter data.
++
++The watchdog uses `last_reported`, not `last_updated`, because unchanged values can still
++be valid fresh reports. Normal observed reporting cadence is roughly 2 seconds for
++grid/battery/PV power and 5–7 seconds for SOC, voltage, limits, operation flags and mode.
++
++Current policy:
++
++- qEMS keeps its existing **30-second** dynamic-feedback stale-data safety pause.
++- A system communication fault is declared after **120 seconds** when at least 2 of the
++  3 core power heartbeats (grid, battery, PV) are stale/invalid, or at least 3 secondary
++  Modbus signals are stale/invalid.
++- A single PV-power channel stale for >120 seconds invalidates that full 30-minute
++  PV-learning period even if the global multi-signal fault threshold is not met.
++- Human alerts are sent at about **180 seconds total stale time** through Home Assistant
++  persistent notification plus the two configured `notify.send_message` targets.
++- Home Assistant startup has a **120-second grace**.
++- Recovery requires **60 seconds continuously healthy**.
++- During a fault, PV Availability keeps its last learned factor, PV learning is frozen,
++  automatic planning and schedule reconciliation are paused, new schedule/qEMS starts
++  are deferred, and qEMS/export-guard Modbus writes are blocked.
