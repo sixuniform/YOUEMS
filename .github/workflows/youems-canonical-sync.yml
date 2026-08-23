@@ -1,0 +1,40 @@
+name: YOUEMS canonical sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.sync/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebuild canonical YOUEMS files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat $(find .sync -maxdepth 1 -type f -name 'payload.part.*' | sort) > /tmp/youems_payload.b64
+          base64 -d /tmp/youems_payload.b64 > /tmp/youems_payload.tar.gz
+          tar -xzf /tmp/youems_payload.tar.gz
+
+          # Git history is the repository version history. Keep only canonical
+          # root source filenames going forward.
+          rm -f solinteg_schedule_v*.yaml dashboard_v*.yaml README_v*.md YOUEMS_CONTEXT_v*.md
+          rm -rf .sync
+          rm -f .github/workflows/youems-canonical-sync.yml
+
+          git config user.name 'YOUEMS sync'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'Sync canonical YOUEMS files'
+          git push
