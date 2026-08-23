@@ -20,12 +20,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat $(find .sync -maxdepth 1 -type f -name 'payload.part.*' | sort) > /tmp/payload.b64
-          base64 -d /tmp/payload.b64 > /tmp/payload.tar.xz
-          tar -xJf /tmp/payload.tar.xz
+
+          # Reconstruct the last repository versions used as patch bases.
+          git show db9904974948542e739f8220153c807c3b6f9fc4:solinteg_schedule_v2026.08.19.00.04.yaml > solinteg_schedule.yaml
+          git show db9904974948542e739f8220153c807c3b6f9fc4:dashboard_v2026.08.18.23.20.yaml > dashboard.yaml
+          git show db9904974948542e739f8220153c807c3b6f9fc4:README.md > README.md
+
+          cat .sync/scheduler.part.* | base64 -d | xz -d > /tmp/scheduler.patch
+          cat .sync/dashboard.part.* | base64 -d | xz -d > /tmp/dashboard.patch
+          cat .sync/README.part.* | base64 -d | xz -d > /tmp/README.patch
+          cat .sync/context.part.* | base64 -d | xz -d > YOUEMS_CONTEXT.md
+
+          patch -p0 < /tmp/scheduler.patch
+          patch -p0 < /tmp/dashboard.patch
+          patch -p0 < /tmp/README.patch
+
           rm -f solinteg_schedule_v*.yaml dashboard_v*.yaml README_v*.md YOUEMS_CONTEXT_v*.md
           rm -rf .sync
           rm -f .github/workflows/youems-sync-once.yml
+
           git config user.name 'YOUEMS sync'
           git config user.email 'actions@users.noreply.github.com'
           git add -A
