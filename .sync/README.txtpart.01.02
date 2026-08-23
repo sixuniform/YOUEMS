@@ -1,0 +1,28 @@
++- The existing schedule is preserved rather than cleared or replaced with a stale-data plan.
++- Recovery rebases the PV-learning energy snapshot and keeps the contaminated current
++  half-hour invalid; the next complete clean Solcast period can learn normally.
++- Recovery also rebases Savings Tracker cumulative-counter baselines so several hours of
++  catch-up energy are not incorrectly priced into one 15-minute slot.
++- If the automatic inverter scheduler is enabled, recovery immediately requests a fresh
++  replan from healthy data.
++
++Diagnostics are exposed as `sensor.youems_inverter_communication_status`,
++`binary_sensor.youems_inverter_communication_fault`, and
++`input_text.youems_inverter_communication_last_event`.
++
+ ### PV Forecast Adaptation
+ 
+ Winter snow, frost, persistent obstruction, or a degraded PV string can make the physical array produce far less than Solcast predicts. Optional **PV Forecast Adaptation** learns a persistent **PV Availability** factor from actual uncurtailed production and applies that factor to the planner's physical solar assumptions.
+@@ -699,6 +858,10 @@
+ - Nord Pool area, currency, taxes, and fees
+ - Solcast forecast entity names
+ 
++### First-install defaults
++
++YOUEMS uses persistent initialized markers for settings whose desired defaults are not the Home Assistant helper minimum. A normal **full Home Assistant restart after installing/updating the package** is the supported initialization path. At startup, one compact initializer applies only still-uninitialized defaults (qEMS tuning, planner reserve, Feed-In advantage, minimum charge power, Sell solar-surplus limit, and PV Forecast Adaptation response defaults). It does not continuously reconcile settings and never overwrites a group after its marker has been set.
++
+ ### 4. Restart Home Assistant
+ 
+ A full restart is recommended after installing the package so all helpers, scripts, template sensors, and automations are created together.
+@@ -739,6 +902,10 @@
+ 
