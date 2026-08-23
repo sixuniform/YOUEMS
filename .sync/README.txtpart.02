@@ -1,0 +1,9 @@
+ The normal Inverter card and schedules do not require pressing a separate Start button; selecting or scheduling a qEMS mode activates it directly.
+ 
++## Clean-baseline maintenance
++
++The current package intentionally omits historical data-format converters and upgrade-only compatibility shims once the current format has become the baseline. In particular, there is no 45→38 charge-acceptance bucket converter, no old Late Charge/Sell price-only anchor converter, no `discharge_hours` service-data alias, and no recurring/hot-reload workaround for first-install defaults. Stable user-facing helper IDs are retained where changing them would lose settings or break existing dashboard references.
++
+ ## Write minimization
+ 
+ Although EMS registers are suitable for repeated control, YOUEMS avoids unnecessary state churn and unsafe reinitialization:
