@@ -1,0 +1,33 @@
+name: YOUEMS one-shot sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.sync/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install canonical YOUEMS files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat $(find .sync -maxdepth 1 -type f -name 'payload.part.*' | sort) > /tmp/payload.b64
+          base64 -d /tmp/payload.b64 > /tmp/payload.tar.xz
+          tar -xJf /tmp/payload.tar.xz
+          rm -f solinteg_schedule_v*.yaml dashboard_v*.yaml README_v*.md YOUEMS_CONTEXT_v*.md
+          rm -rf .sync
+          rm -f .github/workflows/youems-sync-once.yml
+          git config user.name 'YOUEMS sync'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git commit -m 'Sync canonical YOUEMS files'
+          git push
