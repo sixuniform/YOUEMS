@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Rickard Dahlstedt
+
+[Unit]
+Description=Firewall redirect for solinteg-cloud-simulator
+Documentation=https://github.com/sixuniform/YOUEMS/tree/main/solinteg-cloud-simulator
+Wants=network-online.target
+After=network-online.target
+Before=solinteg-cloud-simulator.service
+PartOf=solinteg-cloud-simulator.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/default/solinteg-cloud-simulator
+ExecStart=/opt/solinteg-cloud-simulator/solinteg-cloud-simulator-firewall.sh add
+ExecStop=/opt/solinteg-cloud-simulator/solinteg-cloud-simulator-firewall.sh remove
+TimeoutStartSec=15
+TimeoutStopSec=15

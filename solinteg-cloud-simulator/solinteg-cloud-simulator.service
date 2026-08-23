@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Rickard Dahlstedt
+
+[Unit]
+Description=Local Solinteg cloud acknowledgement simulator
+Documentation=https://github.com/sixuniform/YOUEMS/tree/main/solinteg-cloud-simulator
+Wants=network-online.target
+Requires=solinteg-cloud-simulator-firewall.service
+After=network-online.target solinteg-cloud-simulator-firewall.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=yes
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/default/solinteg-cloud-simulator
+ExecStart=/usr/bin/python3 /opt/solinteg-cloud-simulator/solinteg-cloud-simulator.py --bind ${SIMULATOR_ADDRESS} --port ${LISTEN_PORT}
+Restart=always
+RestartSec=1
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
