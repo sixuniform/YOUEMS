@@ -1,0 +1,99 @@
+--- README.md
++++ README.md
+@@ -17,8 +17,8 @@
+ 
+ This README describes:
+ 
+-- Scheduler: `v2026.08.18.23.55`
+-- Dashboard: `v2026.08.18.23.20`
++- Scheduler: `v2026.08.23.20.01`
++- Dashboard: `v2026.08.22.20.18`
+ 
+ The tested system uses:
+ 
+@@ -262,7 +262,82 @@
+ 
+ These indications may appear especially when available PV exceeds `house load + allowed export`, because 50208 is intentionally forcing the inverter/MPPT system to reduce positive AC output.
+ 
+-A one-time migration helper disables the old persistent inverter Export Limit **switch** if it is still on, then records that migration. The old export-limit percentage is left untouched and YOUEMS never writes either legacy setting again during normal control.
++The native/persistent inverter **Export Limit** feature is outside YOUEMS control and must be left **Off** when commissioning this controller. Current YOUEMS neither reads nor writes that EEPROM-style Export Limit switch/percentage; negative-price limiting is handled entirely through runtime EMS register 50208.
++
++## Sell replan boundary consistency
++
++The rolling Sell energy budget starts from the planner's already-projected **next 15-minute boundary SOC**. Sell gap/load simulation therefore begins at that exact quarter-hour.
++
++Earlier code projected SOC to the next quarter-hour, then started the Sell gap simulation at the next **30-minute** boundary because Solcast is 30-minute data. If the planner boundary was `:15` or `:45`, one 15-minute interval was silently omitted. This could make a marginal Sell slot disappear on a `:29`/`:59` automatic replan and reappear on a manual run just after `:30`/`:00`.
++
++Current behavior walks the Sell gap in **15-minute steps from `planner_next_slot_ts`**, using the enclosing 30-minute Solcast period's average kW for each half. The no-refill ten-hour reserve likewise uses 40×15-minute steps from the planner boundary. The later refill simulation remains 30-minute aligned.
++
++Late Sell anchors are intentionally preserved when current household use temporarily reduces the Sell energy budget; pending records outside the current allocation count remain stored until their destination passes.
++
++## BMS discharge-permission planning guard
++
++YOUEMS allows the configured **Planner Minimum SOC** to be below the Force H3's nominal 10% BMS SOC floor because Operational Shadow SOC and BMS SOC are independent estimates and can differ by several percentage points. Therefore the planner does **not** impose a permanent 10% sSOC minimum.
++
++At every (re)plan, YOUEMS reads `sensor.solax_inverter_battery_discharge_limit`. The existing qEMS runtime already refuses positive battery targets when this BMS current permission is near zero. The planner now uses the same signal:
++
++- discharge limit `> 0.05 A` -> normal planning with the user's selected minimum SOC;
++- discharge limit `<= 0.05 A` -> BMS discharge guard is active.
++
++While guarded, the Force/BMS 10% floor is translated into the current Operational Shadow SOC coordinate system:
++
++```text
++mapped sSOC floor = current Operational sSOC + (10% - current BMS SOC)
++```
++
++The temporary physical floor is the greater of that mapped floor and the **current sSOC**. The latter matters if the BMS has blocked discharge for some reason other than low SOC: the planner must not assume immediate battery use merely because the mapped 10% floor happens to be lower.
++
++The effective automatic-planner floor is then:
++
++```text
++effective planner floor = max(user Planner Minimum SOC, mapped BMS discharge floor)
++```
++
++This means a system at, for example, BMS SOC 10% / Operational sSOC 7% with zero discharge permission can still keep a 7% user setting. It simply plans **no further discharge at 7%**. Solar or grid charging may lift projected sSOC above that floor; later battery use can then be scheduled back down to the floor. On a subsequent real replan, the live BMS discharge-limit signal remains authoritative.
++
++The guard is applied to the automatic Self-Consumption/dispatch reserve, Sell planning, Feed-In safety, and the currently-running-slot SOC projection. Protected manual slots remain user-owned; actual qEMS battery targets are still independently blocked by the runtime BMS permission guard.
++
++Planner notifications show the live BMS discharge limit, BMS SOC, mapped sSOC floor, and any temporary effective planner floor.
++
++### Charge Loss cycle-contamination guard and rejected-attempt diagnostics
++
++Charge Loss learning now treats any declared inverter/Modbus communication fault during
++a full-to-full interval as contamination of that entire learning cycle.
++
++- `input_boolean.youems_shadow_charge_loss_cycle_contaminated` is latched when the
++  system communication watchdog declares a fault.
++- The latch deliberately survives communication recovery and HA restart.
++- At the next automatic `FULL LIMIT` anchor, the cycle is categorically rejected for
++  Charge Loss learning even if its final Q/D ratio happens to look plausible.
++- The new healthy anchor then clears the latch and starts a clean cycle.
++- A healthy manual anchor also starts a new clean interval and clears the latch.
++- `input_text.youems_shadow_charge_loss_last_attempt` records **every automatic full**
++  attempt, accepted or rejected, before the fine Q/D counters are reset.
++- The diagnostic includes previous anchor type/SOC, Q, D, observed loss and a concrete
++  rejection reason (communication contamination, untrusted previous anchor, shallow
++  cycle, observed loss below 0%, or observed loss above 5%).
++- `sensor.youems_charge_loss` exposes `last_attempt` and `cycle_contaminated` attributes.
++- `input_text.youems_shadow_charge_loss_last_update` remains the last **accepted**
++  learning event only.
++
++This avoids learning from a cycle that crossed an inverter/Modbus outage and makes a
++rejected full-to-full closure auditable instead of silently leaving the sample count
++unchanged.
++
++## Shadow SOC restart / inverter-communications resilience
++
++When stitched Force H3 fine-counter tracking is initialized, the Solinteg lifetime charge/discharge totals are **diagnostic only**. A temporary inverter-communications failure can briefly expose a numeric zero or stale lower lifetime total. That must not be interpreted as a physical counter reset and must not invalidate Shadow SOC.
++
++Current behavior:
++
++- while `input_boolean.youems_shadow_fine_counter_initialized` is ON, lower Solinteg lifetime totals are ignored for Shadow validity;
++- coarse lifetime-counter reset handling is used only when fine tracking is unavailable and the system is already operating in coarse fallback mode.
++
++This permanently prevents the false-reset failure seen after a transient Modbus/inverter dropout followed by a Home Assistant restart. No special one-time recovery path remains in normal code.
+ 
+ ## Shadow SOC estimator
+ 
+@@ -311,6 +386,90 @@
+ - A measured time-of-day household load profile
