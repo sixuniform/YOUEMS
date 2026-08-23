@@ -28,14 +28,13 @@ jobs:
 
           cat .sync/scheduler.part.* | base64 -d | xz -d > /tmp/scheduler.patch
           cat .sync/dashboard.part.* | base64 -d | xz -d > /tmp/dashboard.patch
-          cat .sync/README.part.* | base64 -d | xz -d > /tmp/README.patch
-          cat .sync/context.part.* | base64 -d | xz -d > YOUEMS_CONTEXT.md
+          cat .sync/README.txtpart.* > /tmp/README.patch
 
           patch -p0 < /tmp/scheduler.patch
           patch -p0 < /tmp/dashboard.patch
           patch -p0 < /tmp/README.patch
 
-          rm -f solinteg_schedule_v*.yaml dashboard_v*.yaml README_v*.md YOUEMS_CONTEXT_v*.md
+          rm -f solinteg_schedule_v*.yaml dashboard_v*.yaml README_v*.md
           rm -rf .sync
           rm -f .github/workflows/youems-sync-once.yml
 
