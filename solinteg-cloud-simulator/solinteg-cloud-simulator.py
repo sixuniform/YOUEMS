@@ -33,7 +33,12 @@ MAGIC: Final = b"ST"
 ACK_DECLARED_LENGTH: Final = 49
 ACK_TOTAL_LENGTH: Final = 58
 MAX_FRAME_LENGTH: Final = 1024 * 1024
-KNOWN_MESSAGE_TYPES: Final = {b"\x01\x03", b"\x01\x04", b"\x01\x44"}
+MESSAGE_TYPE_DESCRIPTIONS: Final = {
+    b"\x01\x03": "device/configuration register snapshot",
+    b"\x01\x04": "current full telemetry snapshot",
+    b"\x01\x44": "buffered historical telemetry snapshot",
+}
+KNOWN_MESSAGE_TYPES: Final = frozenset(MESSAGE_TYPE_DESCRIPTIONS)
 
 
 def make_crc16_table() -> tuple[int, ...]:
@@ -217,6 +222,9 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
 
         message_type = frame[6:8]
         type_text = message_type.hex(":")
+        type_description = MESSAGE_TYPE_DESCRIPTIONS.get(
+            message_type, "previously unseen message type"
+        )
         serial = printable_serial(frame[10:26])
         device_time = format_device_timestamp(frame[26:32])
 
@@ -238,9 +246,10 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
         acknowledgement = build_acknowledgement(frame)
         connection.sendall(acknowledgement)
         logging.info(
-            "frame %d acknowledged: type=%s serial=%s length=%d time=%s",
+            "frame %d acknowledged: type=%s (%s) serial=%s length=%d time=%s",
             frame_number,
             type_text,
+            type_description,
             serial,
             len(frame),
             device_time,
@@ -267,6 +276,8 @@ class SolintegServer(socketserver.ThreadingTCPServer):
 def run_self_test() -> None:
     if crc16_modbus(b"123456789") != 0x4B37:
         raise AssertionError("CRC-16/Modbus test vector failed")
+    if KNOWN_MESSAGE_TYPES != frozenset(MESSAGE_TYPE_DESCRIPTIONS):
+        raise AssertionError("known message types and descriptions differ")
 
     serial = b"TESTSIM000000001"  # Exactly 16 bytes.
     timestamp = bytes((26, 8, 23, 22, 20, 56))
