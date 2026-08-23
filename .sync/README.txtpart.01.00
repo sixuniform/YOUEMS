@@ -1,0 +1,37 @@
+ - Manual schedules that must not be overwritten and whose forecast battery effect is included in the planning energy budget
+ 
++## Inverter communication watchdog
++### Degraded-communication operating-mode policy
++
++The SolaX integration's native
++`sensor.solinteg_inverter_communication_health` is part of the system watchdog, but its
++states are deliberately not treated equally. Real testing showed that SolaX can remain
++`Degraded` with `success_rate=100%` while grid/PV/battery telemetry is updating live
++every second. Therefore `Degraded`, `Quarantined` (and `unknown`/`unavailable`) are **advisory only**
++when telemetry remains fresh. `Quarantined` means the SolaX integration has stopped
++polling one or more registers it considers problematic; it is surfaced distinctly, but
++does not prove the entire inverter link is unusable. These states cannot by themselves
++force qEMS out of a running mode. Native `Offline` persisting for 120 seconds remains a
++hard fault source.
++The independent multi-entity `last_reported` watchdog remains the primary hard telemetry
++test. A proxy that serves cached reads can still make both ordinary entities and SolaX
++health look healthy; broker-side real-read health should therefore be added separately
++when the proxy exposes it.
++
++When the hard communication fault is active:
++
++- `qEMS Feed-In`, `qEMS Self-Consumption`, and `qEMS PV Charge+House` are considered
++  unsafe because their BattCtrl target depends on continuously fresh power feedback.
++  If one is running or requested, YOUEMS stops its feedback controller and makes one
++  forced switch to native `EMS General`.
++- `qEMS PV Charge`, `qEMS Battery Freeze`, `qEMS Battery Charge`, and
++  `qEMS Battery Discharge` may remain/start. PV Charge and Freeze keep their fixed
++  target. Battery Charge/Discharge are converted once to the user's requested static
++  ±kW target (removing any stale PV/load feedback uplift), then the one-second
++  controller performs no periodic writes until communication is healthy again.
++- Native `EMS General` is always acceptable.
++- The negative-price export limiter is disabled. If 50208 is restrictive, YOUEMS makes
++  one best-effort release to 200 kW. Economic export loss is preferred to repeatedly
++  manipulating 50208 from unreliable feedback.
++- Every communication-forced mode/output action is written to
++  `input_text.youems_inverter_communication_last_forced_action` and the HA system log.
