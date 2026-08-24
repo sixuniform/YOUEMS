@@ -279,6 +279,19 @@ them as empirically discovered `RW` candidates: cloud writability is proven,
 while direct writes through the inverter's public Modbus interface should be
 verified cautiously on each firmware version.
 
+### Intelligent/ToU schedule writing through Modbus
+
+A complete controlled upload exposed the previously undocumented
+Intelligent/ToU schedule staging interface at `53070–53084`: separate Today
+and Tomorrow banks, 24 slot records per day, packed start/stop times, per-slot
+operating modes, power and SOC fields, and a bank commit strobe. All 51 writes
+in the captured transaction received genuine success responses from the
+inverter.
+
+The full register map, confirmed and inferred mode values, exact write order,
+readback limitations, and a dry-run-first `pymodbus` example are documented in
+**[Writing Solinteg Intelligent/ToU schedules through Modbus](SOLINTEG_TOU_MODBUS.md)**.
+
 The controlled writes also captured their genuine inverter acknowledgements.
 Single-register requests were 58 bytes, while a seven-register TOU request was
 74 bytes. The success reply is fixed at 58 bytes in both cases: it preserves
