@@ -41,7 +41,7 @@ PROBES = (
         "service_parameters",
         20000,
         16,
-        "RTC, energy/hour duplicates, serial settings, and Modbus ID candidates",
+        "RTC, energy/hour duplicates, and opaque communication settings",
     ),
     Probe(
         "endpoint_strings",
@@ -241,12 +241,12 @@ def print_interpretations(
             f"{value} / 0x{value:04X} / bits={value:016b}"
         )
 
-    device_id_candidate = get_words(registers, 20012, 1)
-    if device_id_candidate is not None:
-        value = device_id_candidate[0]
+    communication_parameter = get_words(registers, 20012, 1)
+    if communication_parameter is not None:
+        value = communication_parameter[0]
         print(
-            "20012 Modbus device-ID candidate: "
-            f"{value}; current request unit={slave}; match={value == slave}"
+            "20012 opaque communication parameter: "
+            f"{value}; request unit={slave}; this is not the Modbus TCP unit ID"
         )
 
     for address, label in (
