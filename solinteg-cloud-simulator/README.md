@@ -684,6 +684,22 @@ and live measurements. The cloud-input log contains every server reply or
 command and may contain control or account-related data. Treat diagnostic logs
 as private and scrub them before sharing.
 
+## Disclaimer
+
+Use this software entirely at your own risk. It is provided **as is**, without
+any express or implied warranty of correctness, fitness for a particular
+purpose, safety, reliability, or compatibility with any inverter, battery,
+network, cloud service, or firmware version.
+
+You are solely responsible for reviewing the code and configuration, testing
+it safely, monitoring the affected equipment, and maintaining a working
+rollback method. To the maximum extent permitted by law, the author and
+contributors are not liable for any direct, indirect, incidental, special, or
+consequential loss, damage, cost, or injury arising from the use of—or inability
+to use—this software. This includes, without limitation, equipment damage,
+unsafe operation, data loss, increased energy costs, interrupted monitoring or
+control, loss of cloud access, and warranty or support consequences.
+
 This project is not affiliated with or endorsed by Solinteg. Solinteg is a
 trademark of its respective owner.
 
