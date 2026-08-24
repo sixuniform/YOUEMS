@@ -5,9 +5,10 @@
 
 This program is intended to listen behind a firewall/NAT REDIRECT rule that
 redirects the inverter communication module's connection to
-8.211.16.247:5743 onto this host.  It does not contact Solinteg or forward any
-telemetry.  It validates each incoming ST frame and returns the 58-byte
-application acknowledgement observed from the real Solinteg server.
+8.211.16.247:5743 onto this host.  It validates each incoming ST frame and
+returns the 58-byte application acknowledgement observed from the real
+Solinteg server.  An optional isolated worker can mirror acknowledged frames
+to the real endpoint through SOCKS5; cloud input is logged and ignored.
 
 Observed request families: 01:03, 01:04, and 01:44.
 
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Final, NamedTuple, Optional
 
 from solinteg_modbus_map import decode_register_range
+from solinteg_cloud_forwarder import CloudForwarder, parse_endpoint
 
 
 MAGIC: Final = b"ST"
@@ -44,6 +46,10 @@ MAX_FRAME_LENGTH: Final = 1024 * 1024
 DEFAULT_UNKNOWN_LOG_FILE: Final = Path(
     "/var/log/solinteg-cloud-simulator/unknown-frames.jsonl"
 )
+DEFAULT_CLOUD_INCOMING_LOG_FILE: Final = Path(
+    "/var/log/solinteg-cloud-simulator/cloud-incoming.jsonl"
+)
+DEFAULT_CLOUD_TARGET: Final = "iot.solinteg-cloud.com:5743"
 MESSAGE_TYPE_DESCRIPTIONS: Final = {
     b"\x01\x03": "device/configuration register snapshot",
     b"\x01\x04": "current full telemetry snapshot",
@@ -408,10 +414,15 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
                     )
                 return
 
-        # The acknowledgement is deliberately sent before verbose decoding or
-        # disk logging.  Diagnostic work must never delay the inverter.
+        # The acknowledgement is deliberately sent before cloud forwarding,
+        # verbose decoding, or disk logging.  SOCKS, Internet, cloud and
+        # diagnostic work must never delay the inverter.
         acknowledgement = build_acknowledgement(frame)
         connection.sendall(acknowledgement)
+
+        if self.server.cloud_forwarder is not None:
+            self.server.cloud_forwarder.enqueue(frame)
+
         logging.info(
             "frame %d acknowledged: type=%s (%s) serial=%s length=%d time=%s",
             frame_number,
@@ -454,10 +465,12 @@ class SolintegServer(socketserver.ThreadingTCPServer):
         strict_known_types: bool,
         verbose_registers: bool,
         unknown_log_file: Optional[Path],
+        cloud_forwarder: Optional[CloudForwarder],
     ) -> None:
         self.strict_known_types = strict_known_types
         self.verbose_registers = verbose_registers
         self.unknown_log_file = unknown_log_file
+        self.cloud_forwarder = cloud_forwarder
         super().__init__(server_address, SolintegRequestHandler)
 
     def server_bind(self) -> None:
@@ -553,6 +566,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--forward-socks5",
+        type=str,
+        metavar="HOST:PORT",
+        help=(
+            "mirror acknowledged inverter frames to the cloud through this "
+            "SOCKS5 proxy; cloud replies are logged and ignored"
+        ),
+    )
+    parser.add_argument(
+        "--forward-target",
+        default=DEFAULT_CLOUD_TARGET,
+        metavar="HOST:PORT",
+        help=(
+            "remote cloud target sent to the SOCKS5 proxy "
+            f"(default: {DEFAULT_CLOUD_TARGET})"
+        ),
+    )
+    parser.add_argument(
+        "--cloud-incoming-log",
+        type=Path,
+        default=DEFAULT_CLOUD_INCOMING_LOG_FILE,
+        metavar="PATH",
+        help=(
+            "JSON Lines file for ignored cloud input "
+            f"(default: {DEFAULT_CLOUD_INCOMING_LOG_FILE})"
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run protocol and CRC self-tests, then exit",
@@ -560,6 +601,15 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+    if args.forward_socks5 is not None:
+        try:
+            args.forward_socks5 = parse_endpoint(args.forward_socks5)
+        except ValueError as error:
+            parser.error(f"invalid --forward-socks5 value: {error}")
+    try:
+        args.forward_target = parse_endpoint(args.forward_target)
+    except ValueError as error:
+        parser.error(f"invalid --forward-target value: {error}")
     return args
 
 
@@ -570,12 +620,32 @@ def main() -> int:
         return 0
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    cloud_forwarder: Optional[CloudForwarder] = None
+    if args.forward_socks5 is not None:
+        username = os.environ.get("SOLINTEG_SOCKS5_USERNAME")
+        password = os.environ.get("SOLINTEG_SOCKS5_PASSWORD")
+        if password and not username:
+            logging.error(
+                "SOLINTEG_SOCKS5_PASSWORD is set without "
+                "SOLINTEG_SOCKS5_USERNAME"
+            )
+            return 2
+        cloud_forwarder = CloudForwarder(
+            proxy=args.forward_socks5,
+            target=args.forward_target,
+            incoming_log_file=args.cloud_incoming_log,
+            username=username if username else None,
+            password=password,
+        )
+
     try:
         server = SolintegServer(
             (args.bind, args.port),
             args.strict_known_types,
             args.verbose,
             args.log_unknown,
+            cloud_forwarder,
         )
     except OSError as error:
         logging.error("cannot listen on %s:%d: %s", args.bind, args.port, error)
@@ -593,6 +663,18 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
+    if cloud_forwarder is not None:
+        cloud_forwarder.start()
+        logging.info(
+            "SOCKS5 cloud mirror enabled: proxy=%s target=%s incoming=%s; "
+            "all cloud input will be logged and ignored",
+            args.forward_socks5,
+            args.forward_target,
+            args.cloud_incoming_log,
+        )
+    else:
+        logging.info("SOCKS5 cloud mirror disabled")
+
     logging.info(
         "Solinteg simulator listening on %s:%d; strict=%s verbose=%s log_unknown=%s",
         args.bind,
@@ -605,6 +687,8 @@ def main() -> int:
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+        if cloud_forwarder is not None:
+            cloud_forwarder.stop()
     logging.info("Solinteg simulator stopped")
     return 0
 

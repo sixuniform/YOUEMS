@@ -8,13 +8,19 @@ telemetry endpoint. It accepts the inverter communication module's TCP
 connection and immediately returns the same application acknowledgement that
 was observed from the real server.
 
+It can optionally mirror a copy of each acknowledged inverter frame to the
+real cloud through a SOCKS5 proxy. This forwarding path is deliberately
+one-way: bytes received from the cloud are logged and ignored, never delivered
+to the inverter.
+
 This is **not** a Modbus simulator. It does not read or write inverter
 registers. Its purpose is to keep cloud telemetry work from blocking the
 communication module and, indirectly, delaying local Modbus TCP traffic.
 
-The simulator does not forward traffic to Solinteg or deliberately delay
-replies. It saves no telemetry payloads unless the optional unknown-frame
-logger is explicitly enabled.
+Cloud mirroring is disabled by default. The simulator never deliberately
+delays local replies. It saves no complete payloads unless the optional
+unknown-frame logger is enabled or SOCKS5 mirroring is enabled, in which case
+all ignored cloud input is saved for reverse engineering.
 
 ## Why this exists
 
@@ -30,11 +36,21 @@ is a small deterministic acknowledgement. This program generates that reply
 locally, so the communication module sees a successful cloud transaction
 without any Internet dependency.
 
+When cloud visibility is wanted, the optional mirror preserves that immediate
+local reply while sending telemetry independently. A slow or unavailable
+proxy, VPN, DNS server, Internet route, or Solinteg server cannot hold up the
+inverter-facing connection.
+
 The confirmed destination is exactly:
 
 ```text
 8.211.16.247/32, TCP port 5743
 ```
+
+The corresponding cloud hostname is `iot.solinteg-cloud.com`. The SOCKS5
+mirror uses that hostname by default and asks the **remote proxy** to resolve
+it. It therefore does not follow the Linux host's local `/32` route back into
+the simulator.
 
 An earlier suspected network, `155.102.215.0/24`, is **not used** by this
 package and should not be redirected or blocked on its behalf.
@@ -170,6 +186,7 @@ but is intentionally not enabled by the service.
 - `iptables-nft`
 - IPv4 forwarding enabled on the interception host
 - a LAN-router static route for `8.211.16.247/32` via that host
+- optionally, a reachable SOCKS5 proxy for one-way cloud mirroring
 
 The separate `nft` and `conntrack` command-line tools are not required. This
 package deliberately calls `iptables-nft`, so an unrelated legacy iptables
@@ -185,6 +202,7 @@ SIMULATOR_ADDRESS=192.168.10.50
 INVERTER_ADDRESS=192.168.10.99
 CLOUD_ADDRESS=8.211.16.247
 LISTEN_PORT=5743
+# Example: SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080"
 SIMULATOR_OPTIONS=
 ```
 
@@ -243,7 +261,8 @@ timeout. Seeing no new connection for a few minutes is not by itself a fault.
 ## Logging options
 
 Both diagnostic modes run only after the protocol acknowledgement has been
-sent. Decoding and file I/O therefore do not delay the cloud reply.
+sent. Decoding and file I/O therefore do not delay the local reply. SOCKS5
+mirroring is also queued only after that reply has been sent.
 
 ### `--verbose`
 
@@ -289,13 +308,89 @@ sudo tail -n 1 \
 An explicit alternate destination can be supplied as the next argument, for
 example `--log-unknown /tmp/unknown-frames.jsonl`.
 
-### Enabling options under systemd
+## One-way SOCKS5 cloud mirror
 
-Set `SIMULATOR_OPTIONS` in `/etc/default/solinteg-cloud-simulator`, then restart
-the service. Use either flag independently or both together:
+Enable the mirror by giving the proxy endpoint. The real cloud target defaults
+to `iot.solinteg-cloud.com:5743`:
 
 ```ini
-SIMULATOR_OPTIONS="--verbose --log-unknown"
+SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080"
+```
+
+The implementation is intentionally not a transparent bidirectional proxy:
+
+1. The simulator validates the inverter frame.
+2. It sends the deterministic local acknowledgement to the inverter.
+3. Only then does it make a non-blocking insertion into a bounded background
+   queue.
+4. A separate thread opens a long-lived SOCKS5 connection and forwards queued
+   frames in order.
+5. Everything received from the cloud is logged and ignored. There is no code
+   path from the cloud socket to an inverter socket.
+
+The queue holds at most 256 frames. If the remote route remains unavailable
+long enough to fill it, the oldest telemetry is discarded in favour of newer
+telemetry. SOCKS connection attempts, authentication, hostname resolution,
+reconnect backoff, cloud writes, cloud reads, and cloud-log file I/O all occur
+in the background thread. None of them can block generation of the local
+acknowledgement.
+
+The proxy receives a SOCKS5 domain-name CONNECT request, so it—not the
+interception host—resolves `iot.solinteg-cloud.com`. To use a different cloud
+endpoint explicitly:
+
+```ini
+SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080 --forward-target example.invalid:5743"
+```
+
+For a proxy using username/password authentication, set these separately in
+`/etc/default/solinteg-cloud-simulator`; they are not included in the process
+command line:
+
+```ini
+SOLINTEG_SOCKS5_USERNAME=example-user
+SOLINTEG_SOCKS5_PASSWORD=example-password
+```
+
+Omit both variables for a proxy that authenticates by VPN or source network.
+SOCKS5 no-auth and RFC 1929 username/password authentication are supported.
+
+### Ignored cloud-input log
+
+Every complete `ST` frame received from the real cloud is appended to:
+
+```text
+/var/log/solinteg-cloud-simulator/cloud-incoming.jsonl
+```
+
+Unframed or partial bytes are saved as their own records, so input is not
+silently lost when the remote connection closes or a new server message format
+appears. Each JSON Lines record contains receive time, direction,
+`action=ignored`, record kind, target, length, SHA-256, and the complete bytes
+as base64. Recognised `ST` framing also records the two-byte type and CRC
+validity. The path can be changed with `--cloud-incoming-log PATH`.
+
+To reconstruct the newest cloud frame:
+
+```bash
+sudo tail -n 1 \
+  /var/log/solinteg-cloud-simulator/cloud-incoming.jsonl \
+  | jq -r .frame_base64 \
+  | base64 -d > ignored-solinteg-cloud-frame.bin
+```
+
+The normal 58-byte cloud acknowledgements are included. Any future remote
+control or configuration message will likewise be recorded and ignored by
+this first implementation.
+
+## Enabling options under systemd
+
+Set `SIMULATOR_OPTIONS` in `/etc/default/solinteg-cloud-simulator`, then restart
+the service. Diagnostic and forwarding options may be used independently or
+together:
+
+```ini
+SIMULATOR_OPTIONS="--verbose --log-unknown --forward-socks5 192.168.0.1:1080"
 ```
 
 ```bash
@@ -305,7 +400,7 @@ sudo journalctl -u solinteg-cloud-simulator.service -f
 
 The installer preserves an existing configuration during upgrades. If the
 file predates these options, add `SIMULATOR_OPTIONS=` to it manually before
-enabling either mode.
+enabling any mode.
 
 ## Troubleshooting
 
@@ -383,17 +478,21 @@ This is experimental, independently developed software based on captures from
 one Solinteg hybrid-inverter installation. Other models, firmware versions,
 regions, or future cloud protocol revisions may behave differently.
 
-Redirecting the endpoint disables delivery of the intercepted telemetry to the
-vendor and may affect cloud monitoring, remote diagnostics, firmware services,
+With cloud mirroring disabled, redirecting the endpoint disables delivery of
+the intercepted telemetry to the vendor. With mirroring enabled, telemetry is
+sent but cloud-to-inverter messages are deliberately suppressed. Either mode
+may affect cloud monitoring, remote diagnostics, controls, firmware services,
 warranty support, or safety notifications. Keep local monitoring and a tested
-rollback path. Do not expose the simulator listener to untrusted networks.
+rollback path. Do not expose the simulator listener or SOCKS proxy to untrusted
+networks.
 
 The simulator normally logs the communication-module serial number, message
 type, frame length, and device timestamp to the system journal. `--verbose`
 adds decoded live measurements to that journal. `--log-unknown` writes complete
 unknown frames to disk; those frames can contain identifiers, configuration,
-and live measurements. Treat diagnostic logs as private and scrub them before
-sharing.
+and live measurements. The cloud-input log contains every ignored server
+reply and may contain control or account-related data. Treat diagnostic logs
+as private and scrub them before sharing.
 
 This project is not affiliated with or endorsed by Solinteg. Solinteg is a
 trademark of its respective owner.

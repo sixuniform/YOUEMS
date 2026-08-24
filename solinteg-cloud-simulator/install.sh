@@ -21,6 +21,9 @@ install -m 0755 \
 install -m 0644 \
     "$source_directory/solinteg_modbus_map.py" \
     "$install_directory/solinteg_modbus_map.py"
+install -m 0644 \
+    "$source_directory/solinteg_cloud_forwarder.py" \
+    "$install_directory/solinteg_cloud_forwarder.py"
 install -m 0755 \
     "$source_directory/solinteg-cloud-simulator-firewall.sh" \
     "$install_directory/solinteg-cloud-simulator-firewall.sh"
