@@ -145,12 +145,15 @@ counters, battery state, limits, temperatures, and diagnostic fields. No
 captured identifier, manufacturer string, or measurement is required to
 describe or reproduce the packet structure.
 
-The simulator includes the complete translation metadata from Modbus Broker
-v5.12. That table combines the current Home Assistant Solinteg plugin with
-Solinteg protocol v00.02 and covers unsigned and signed 16/32-bit values,
+The simulator and Modbus Broker share the canonical translation metadata in
+`solinteg_modbus_map.py`. Its starting table came from Modbus Broker v5.12 and
+combines the current Home Assistant Solinteg plugin with Solinteg protocol
+v00.02. Controlled empirical findings are added with explicit source and
+confidence metadata. The map covers unsigned and signed 16/32-bit values,
 scaling, units, strings, versions, packed date/time fields, enums, alarm/status
-bits, and the BMS status word. The optional verbose logger applies those same
-translations directly to every register range carried by the cloud frame.
+bits, the BMS status word, and the newer Intelligent/ToU staging interface.
+The optional verbose logger applies those same translations directly to every
+register range carried by the cloud frame.
 
 ### Read-only probe for tentative service/network registers
 
@@ -256,6 +259,7 @@ inverter:
 | Register(s) | Decoded purpose |
 |---:|---|
 | `20000–20002` | Automatic inverter real-time-clock synchronization |
+| `21001` | Battery SOC Reset enable: `0` off/never, `1` enabled; cadence is stored elsewhere or internally |
 | `25009` | Inverter restart |
 | `50000` | Working-mode selection |
 | `50007` | Import-limit switch |
@@ -264,6 +268,8 @@ inverter:
 | `50017` | Peak Shaving Minimum SOC, scaled by 0.1% |
 | `50018` | Peak Shaving Battery Max Grid Charge, scaled by 0.1 kW |
 | `50022` | Peak Shaving switch: `0` off, `1` on |
+| `53070` | Intelligent/ToU Today or Tomorrow schedule commit strobe |
+| `53071–53084` | One complete Intelligent/ToU schedule-slot staging record |
 
 The captured clock command encoded the exact local date and time in three
 packed registers. Controlled working-mode, restart, and import-limit changes
@@ -278,6 +284,11 @@ current upstream Solinteg Home Assistant plugin. The simulator therefore marks
 them as empirically discovered `RW` candidates: cloud writability is proven,
 while direct writes through the inverter's public Modbus interface should be
 verified cautiously on each firmware version.
+
+Register `21001` was isolated by comparing the app's SOC Reset choices. Off or
+Never wrote `0`; Once, Daily, 7-day, 15-day, and 30-day choices all wrote `1`.
+It is therefore a confirmed enable field, but the selected cadence is not
+encoded in that register and remains unresolved.
 
 ### Intelligent/ToU schedule writing through Modbus
 
