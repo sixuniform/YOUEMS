@@ -2,7 +2,7 @@
 # Copyright 2026 Rickard Dahlstedt
 
 [Unit]
-Description=Local Solinteg cloud acknowledgement simulator
+Description=Local Solinteg cloud and technical endpoint simulator
 Documentation=https://github.com/sixuniform/YOUEMS/tree/main/solinteg-cloud-simulator
 Wants=network-online.target
 Requires=solinteg-cloud-simulator-firewall.service

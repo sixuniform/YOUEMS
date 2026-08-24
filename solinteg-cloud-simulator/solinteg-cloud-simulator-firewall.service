@@ -2,7 +2,7 @@
 # Copyright 2026 Rickard Dahlstedt
 
 [Unit]
-Description=Firewall redirect for solinteg-cloud-simulator
+Description=Cloud and technical endpoint redirects for solinteg-cloud-simulator
 Documentation=https://github.com/sixuniform/YOUEMS/tree/main/solinteg-cloud-simulator
 Wants=network-online.target
 After=network-online.target

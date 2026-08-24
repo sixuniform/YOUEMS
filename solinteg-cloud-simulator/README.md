@@ -3,18 +3,21 @@
 
 # solinteg-cloud-simulator
 
-`solinteg-cloud-simulator` is a small local replacement for the Solinteg cloud
-telemetry endpoint. It accepts the inverter communication module's TCP
-connection and immediately returns the same application acknowledgement that
-was observed from the real server.
+`solinteg-cloud-simulator` is a small local replacement for the two observed
+Solinteg TCP endpoints. It accepts the inverter communication module's normal
+cloud connection on local port `5743` and its technical-service connection on
+local port `5744`, keeping the streams separate. It immediately returns the
+same application acknowledgement that was observed from the real server.
 
 It can optionally mirror a copy of each acknowledged inverter frame to the
-real cloud through a SOCKS5 proxy. This forwarding path is deliberately
-one-way by default: bytes received from the cloud are logged and ignored. A
-separate, explicit test switch can temporarily forward cloud commands while
-their real inverter responses are being reverse engineered. Another explicit
-mode keeps `01:10` writes blocked but returns a locally generated success
-acknowledgement to the cloud.
+matching real hostname through a SOCKS5 proxy. This forwarding path is
+deliberately one-way by default: bytes received from either server are logged
+and ignored. A separate, explicit test switch can temporarily forward normal
+cloud commands while their real inverter responses are being reverse
+engineered. Another explicit mode keeps `01:10` writes blocked but returns a
+locally generated success acknowledgement to the cloud. These command modes
+apply only to the normal cloud endpoint; technical-server input is always
+ignored.
 
 This is **not** a Modbus simulator. It does not read or write inverter
 registers. Its purpose is to keep cloud telemetry work from blocking the
@@ -44,16 +47,19 @@ local reply while sending telemetry independently. A slow or unavailable
 proxy, VPN, DNS server, Internet route, or Solinteg server cannot hold up the
 inverter-facing connection.
 
-The confirmed destination is exactly:
+The confirmed destinations are:
 
-```text
-8.211.16.247/32, TCP port 5743
-```
+| Purpose label | Hostname | Observed IPv4 address | Remote port | Local listener |
+|---|---|---:|---:|---:|
+| Normal cloud | `iot.solinteg-cloud.com` | `8.211.16.247/32` | 5743 | 5743 |
+| Technical service | `iot.solinteg-tech.com` | `8.209.105.201/32` | 5743 | 5744 |
 
-The corresponding cloud hostname is `iot.solinteg-cloud.com`. The SOCKS5
-mirror uses that hostname by default and asks the **remote proxy** to resolve
-it. It therefore does not follow the Linux host's local `/32` route back into
-the simulator.
+The functional distinction is inferred primarily from the hostnames; the
+complete purpose of the technical service has not been proven. Both SOCKS5
+mirrors use hostnames and ask the **remote proxy** to resolve them. They
+therefore do not follow the Linux host's local `/32` routes back into the
+simulator. Port `5744` exists only on the interception host to preserve the
+original destination identity.
 
 An earlier suspected network, `155.102.215.0/24`, is **not used** by this
 package and should not be redirected or blocked on its behalf.
@@ -61,22 +67,25 @@ package and should not be redirected or blocked on its behalf.
 ## Tested topology
 
 ```mermaid
-flowchart LR
-    I["Solinteg module<br>192.168.10.99"] -->|"8.211.16.247:5743"| R["LAN router"]
-    R -->|"static /32 route"| L["Linux host<br>192.168.10.50"]
-    L -->|"exact NAT REDIRECT"| S["local simulator<br>TCP 5743"]
+flowchart TB
+    I["Solinteg module<br>192.168.10.99"] --> R["LAN router"]
+    R -->|"two static /32 routes"| L["Linux host<br>192.168.10.50"]
+    L -->|"8.211.16.247 → 5743"| C["Cloud listener"]
+    L -->|"8.209.105.201 → 5744"| T["Tech listener"]
 ```
 
-The LAN router must have a static route for `8.211.16.247/32` via the Linux
-host. The included firewall service then redirects only packets matching all
-of these fields:
+The LAN router must have static routes for both `/32` addresses via the Linux
+host. The included firewall service then installs two destination-specific
+redirects. Each rule matches all of these fields:
 
 - incoming interface;
 - inverter source address `/32`;
-- cloud destination address `8.211.16.247/32`;
+- one exact destination address `/32`;
 - TCP destination port `5743`.
 
-No general cloud subnet block or redirect is installed.
+The cloud destination remains on local port `5743`; the technical destination
+is redirected to local port `5744`. No general cloud subnet block or redirect
+is installed.
 
 ## Protocol findings
 
@@ -276,8 +285,9 @@ but is intentionally not enabled by the service.
 - Python 3.9 or later
 - `iptables-nft`
 - IPv4 forwarding enabled on the interception host
-- a LAN-router static route for `8.211.16.247/32` via that host
-- optionally, a reachable SOCKS5 proxy for one-way cloud mirroring
+- LAN-router static routes for `8.211.16.247/32` and `8.209.105.201/32` via
+  that host
+- optionally, a reachable SOCKS5 proxy for isolated endpoint mirroring
 
 The separate `nft` and `conntrack` command-line tools are not required. This
 package deliberately calls `iptables-nft`, so an unrelated legacy iptables
@@ -292,15 +302,40 @@ LAN_INTERFACE=enxb827ebf678ea
 SIMULATOR_ADDRESS=192.168.10.50
 INVERTER_ADDRESS=192.168.10.99
 CLOUD_ADDRESS=8.211.16.247
+TECH_ADDRESS=8.209.105.201
 LISTEN_PORT=5743
+TECH_LISTEN_PORT=5744
 # Example: SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083"
 SIMULATOR_OPTIONS=
 ```
 
-1. Configure the router with a static host route:
+1. After any intentional firmware update has completed, configure the router
+   with these two static host routes:
 
    ```text
-   8.211.16.247/32 via 192.168.10.50
+   8.211.16.247/32  via 192.168.10.50
+   8.209.105.201/32 via 192.168.10.50
+   ```
+
+   A route selects only the Linux next hop; it cannot select a TCP port. The
+   firewall rule on that Linux host performs the second mapping:
+
+   ```text
+   8.211.16.247:5743  -> local 192.168.10.50:5743
+   8.209.105.201:5743 -> local 192.168.10.50:5744
+   ```
+
+   The included firewall service creates both mappings. For a foreground test
+   without systemd, the exact technical-endpoint rule is:
+
+   ```bash
+   sudo iptables-nft -t nat -I PREROUTING 1 \
+     -i enxb827ebf678ea \
+     -s 192.168.10.99/32 \
+     -d 8.209.105.201/32 \
+     -p tcp --dport 5743 \
+     -m comment --comment SOLINTEG_SIMULATOR_TECH \
+     -j REDIRECT --to-ports 5744
    ```
 
 2. Edit `solinteg-cloud-simulator.conf` if any interface or address differs.
@@ -318,8 +353,10 @@ systemd units, enables automatic startup, and starts the simulator. An existing
 configuration file is preserved during upgrades.
 
 The main unit uses `Restart=always` with a one-second restart delay. Its
-companion oneshot unit installs the exact redirect before the simulator starts
-and removes that same rule when the service is stopped.
+companion oneshot unit installs both exact redirects before the simulator
+starts and removes those same rules when the service is stopped. Existing
+configuration files without the new `TECH_ADDRESS` and `TECH_LISTEN_PORT`
+variables safely use `8.209.105.201` and `5744` as upgrade defaults.
 
 ## Verification
 
@@ -345,9 +382,10 @@ sudo /usr/bin/python3 \
 ```
 
 The module may connect only about once every five minutes when communication
-is healthy, and it may keep a TCP connection open between transmissions. The
+is healthy, and it may keep TCP connections open between transmissions. The
 simulator therefore has no artificial response delay and no idle socket
-timeout. Seeing no new connection for a few minutes is not by itself a fault.
+timeout. Seeing no new connection on either listener for a few minutes is not
+by itself a fault.
 
 ## Logging options
 
@@ -369,7 +407,7 @@ Example for a manual foreground run:
 ```bash
 sudo /usr/bin/python3 \
   /opt/solinteg-cloud-simulator/solinteg-cloud-simulator.py \
-  --bind 192.168.10.50 --port 5743 --verbose
+  --bind 192.168.10.50 --port 5743 --tech-port 5744 --verbose
 ```
 
 This can produce several hundred journal lines per telemetry frame. It is
@@ -380,8 +418,8 @@ intended for protocol inspection, not routine operation.
 This saves only valid frames whose two-byte message type has not previously
 been identified. Known `01:03`, `01:04`, and `01:44` frames are never written
 by this option. Each unknown frame becomes one JSON Lines record containing
-capture time, peer, type, length, SHA-256, and the complete frame encoded as
-base64. The default file is:
+capture time, endpoint label (`cloud` or `tech`), peer, type, length, SHA-256,
+and the complete frame encoded as base64. The default file is:
 
 ```text
 /var/log/solinteg-cloud-simulator/unknown-frames.jsonl
@@ -400,25 +438,26 @@ sudo tail -n 1 \
 An explicit alternate destination can be supplied as the next argument, for
 example `--log-unknown /tmp/unknown-frames.jsonl`.
 
-## One-way SOCKS5 cloud mirror
+## Isolated SOCKS5 endpoint mirrors
 
-Cloud behavior is selected by command-line options; local-only operation is
-the default:
+Forwarding behavior is selected by command-line options; local-only operation
+is the default:
 
-| Options | Telemetry sent to cloud | Cloud writes reach inverter | Cloud writes fake-ACKed |
+| Options | Inverter frames sent to matching servers | Normal-cloud writes reach inverter | Normal-cloud writes fake-ACKed |
 |---|:---:|:---:|:---:|
-| No `--forward-socks5` | No | No | No cloud connection |
+| No `--forward-socks5` | No | No | No server connections |
 | `--forward-socks5 HOST:PORT` | Yes | No | No |
 | Add `--fake-ack-cloud-commands` | Yes | No | Yes, with temporary `01:03` confirmation |
 | Add `--allow-cloud-commands` | Yes | Yes | No; genuine inverter reply is relayed |
 
 In every mode, inverter telemetry is acknowledged locally before any logging
 or remote work. Omitting `--forward-socks5` therefore preserves the original
-cloud-free simulator: nothing is uploaded and only the local acknowledgement
-is generated.
+fully local simulator: nothing is uploaded and only local acknowledgements are
+generated.
 
-Enable the mirror by giving the proxy endpoint. The real cloud target defaults
-to `iot.solinteg-cloud.com:5743`:
+Enable both mirrors by giving the proxy endpoint. The normal target defaults
+to `iot.solinteg-cloud.com:5743`; the independently isolated technical target
+defaults to `iot.solinteg-tech.com:5743`:
 
 ```ini
 SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083"
@@ -431,11 +470,12 @@ proxy:
 2. It sends the deterministic local acknowledgement to the inverter.
 3. Only then does it make a non-blocking insertion into a bounded background
    queue.
-4. A separate thread opens a long-lived SOCKS5 connection and forwards queued
-   frames in order.
-5. Everything received from the cloud is logged. Telemetry acknowledgements
-   and commands are ignored unless command forwarding or fake command
-   acknowledgement is explicitly enabled.
+4. Separate threads open long-lived SOCKS5 connections to the matching normal
+   and technical hostnames and forward each queue in order.
+5. Everything received from either server is logged. Normal-cloud telemetry
+   acknowledgements and commands are ignored unless command forwarding or
+   fake command acknowledgement is explicitly enabled. Technical-server input
+   is always ignored.
 
 The queue holds at most 256 frames. If the remote route remains unavailable
 long enough to fill it, the oldest telemetry is discarded in favour of newer
@@ -444,12 +484,12 @@ reconnect backoff, cloud writes, cloud reads, and cloud-log file I/O all occur
 in the background thread. None of them can block generation of the local
 acknowledgement.
 
-The proxy receives a SOCKS5 domain-name CONNECT request, so it—not the
-interception host—resolves `iot.solinteg-cloud.com`. To use a different cloud
-endpoint explicitly:
+The proxy receives SOCKS5 domain-name CONNECT requests, so it—not the
+interception host—resolves both Solinteg hostnames. To use different targets
+explicitly:
 
 ```ini
-SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083 --forward-target example.invalid:5743"
+SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083 --forward-target cloud.example.invalid:5743 --tech-forward-target tech.example.invalid:5743"
 ```
 
 For a proxy using username/password authentication, set these separately in
@@ -464,12 +504,18 @@ SOLINTEG_SOCKS5_PASSWORD=example-password
 Omit both variables for a proxy that authenticates by VPN or source network.
 SOCKS5 no-auth and RFC 1929 username/password authentication are supported.
 
-### Cloud-input log
+### Server-input logs
 
-Every complete `ST` frame received from the real cloud is appended to:
+Every complete `ST` frame received from the normal cloud is appended to:
 
 ```text
 /var/log/solinteg-cloud-simulator/cloud-incoming.jsonl
+```
+
+Input from the technical endpoint is kept separate in:
+
+```text
+/var/log/solinteg-cloud-simulator/tech-incoming.jsonl
 ```
 
 Unframed or partial bytes are saved as their own records, so input is not
@@ -479,8 +525,8 @@ record kind, target, length, SHA-256, and the complete bytes as base64.
 Recognised `ST` framing also records the two-byte type and CRC validity. The
 action distinguishes ignored local acknowledgements, blocked commands, fake
 acknowledgements queued for the cloud, commands queued for the inverter,
-invalid input, and routing failures. The path can be changed with
-`--cloud-incoming-log PATH`.
+invalid input, and routing failures. The paths can be changed with
+`--cloud-incoming-log PATH` and `--tech-incoming-log PATH`.
 
 To reconstruct the newest cloud frame:
 
@@ -507,7 +553,7 @@ To learn the inverter's genuine response to cloud writes, temporarily enable:
 
 ```bash
 python3 solinteg-cloud-simulator.py \
-  --bind 192.168.10.50 --port 5743 \
+  --bind 192.168.10.50 --port 5743 --tech-port 5744 \
   --forward-socks5 192.168.0.1:1083 \
   --allow-cloud-commands --verbose --log-unknown
 ```
@@ -531,6 +577,11 @@ restart commands, and power-limit changes. It is disabled by default and is
 incompatible with `--strict-known-types`. Stop the process and restart without
 `--allow-cloud-commands` to return immediately to log-and-ignore operation.
 
+This option applies only to the normal listener on local port `5743`. Input
+received through the technical SOCKS5 connection is always logged and ignored;
+the local `5744` listener has no command router, so technical-server traffic
+cannot reach the inverter through this program.
+
 ### Opt-in fake command acknowledgements
 
 To keep cloud writes away from the inverter while making the cloud transaction
@@ -538,7 +589,7 @@ finish successfully, enable:
 
 ```bash
 python3 solinteg-cloud-simulator.py \
-  --bind 192.168.10.50 --port 5743 \
+  --bind 192.168.10.50 --port 5743 --tech-port 5744 \
   --forward-socks5 192.168.0.1:1083 \
   --fake-ack-cloud-commands --verbose
 ```
@@ -569,6 +620,9 @@ window expires.
 Normal telemetry acknowledgements from the cloud remain suppressed because
 the simulator has already acknowledged those frames locally. Unknown cloud
 frame types remain logged and ignored.
+
+Fake command acknowledgements likewise apply only to the normal cloud
+endpoint. They are never generated for the technical endpoint.
 
 `--fake-ack-cloud-commands` and `--allow-cloud-commands` are mutually
 exclusive. The cloud UI may report that a blocked setting change succeeded
@@ -608,26 +662,26 @@ enabling any mode.
 ### No connection appears
 
 - Wait at least five minutes.
-- Confirm the router's `/32` route points to the Linux host.
+- Confirm both router `/32` routes point to the Linux host.
 - Confirm IPv4 forwarding with `sysctl net.ipv4.ip_forward`.
 - Check whether the exact PREROUTING rule's counter increases.
 - If necessary, restart only the inverter communication module after the
   simulator is ready. Avoid interrupting the inverter power stage unless its
   documentation explicitly requires that.
 
-### The firewall counter remains zero
+### A firewall counter remains zero
 
 The packet is not reaching the Linux host. The common causes are a missing or
-incorrect router route, a different current cloud address, or a communication
-module that has not yet retried.
+incorrect router route, a changed endpoint address, or a communication module
+that has not yet retried.
 
-### Port 5743 is already in use
+### Port 5743 or 5744 is already in use
 
 Stop any earlier `socat`, `nc`, or manually launched simulator process, then
 restart the service:
 
 ```bash
-sudo ss -ltnp 'sport = :5743'
+sudo ss -ltnp '( sport = :5743 or sport = :5744 )'
 sudo systemctl restart solinteg-cloud-simulator.service
 ```
 
@@ -679,9 +733,10 @@ This is experimental, independently developed software based on captures from
 one Solinteg hybrid-inverter installation. Other models, firmware versions,
 regions, or future cloud protocol revisions may behave differently.
 
-With cloud mirroring disabled, redirecting the endpoint disables delivery of
-the intercepted telemetry to the vendor. With mirroring enabled, telemetry is
-sent but cloud-to-inverter messages are suppressed by default. Enabling
+With SOCKS5 mirroring disabled, redirecting either endpoint disables delivery
+of its intercepted traffic to the vendor. With mirroring enabled, inverter
+traffic is sent to the matching hostname but server-to-inverter messages are
+suppressed by default. Enabling
 `--allow-cloud-commands` permits the vendor cloud to perform real register
 writes on the inverter. Enabling `--fake-ack-cloud-commands` instead reports
 those writes as successful without applying them. These modes may affect cloud

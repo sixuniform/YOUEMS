@@ -3,13 +3,15 @@
 # Copyright 2026 Rickard Dahlstedt
 """Local acknowledgement server for the Solinteg cloud telemetry protocol.
 
-This program is intended to listen behind a firewall/NAT REDIRECT rule that
-redirects the inverter communication module's connection to
-8.211.16.247:5743 onto this host.  It validates each incoming ST frame and
-returns the 58-byte application acknowledgement observed from the real
-Solinteg server.  An optional isolated worker can mirror acknowledged frames
-to the real endpoint through SOCKS5. Cloud input is always logged and is
-ignored unless an explicit command-forwarding or fake-ACK test mode is enabled.
+This program is intended to listen behind firewall/NAT REDIRECT rules for the
+inverter communication module's two observed TCP/5743 destinations.  The
+normal cloud endpoint is accepted locally on port 5743 and the technical
+endpoint on port 5744.  Each listener validates incoming ST frames and returns
+the 58-byte application acknowledgement observed from the real Solinteg
+server.  Optional isolated workers mirror the two streams to their matching
+real hostnames through SOCKS5. Cloud input is always logged and is ignored
+unless an explicit command-forwarding or fake-ACK test mode is enabled for the
+normal cloud endpoint.
 
 Observed request families: 01:03, 01:04, and 01:44.
 
@@ -60,7 +62,12 @@ DEFAULT_UNKNOWN_LOG_FILE: Final = Path(
 DEFAULT_CLOUD_INCOMING_LOG_FILE: Final = Path(
     "/var/log/solinteg-cloud-simulator/cloud-incoming.jsonl"
 )
+DEFAULT_TECH_INCOMING_LOG_FILE: Final = Path(
+    "/var/log/solinteg-cloud-simulator/tech-incoming.jsonl"
+)
 DEFAULT_CLOUD_TARGET: Final = "iot.solinteg-cloud.com:5743"
+DEFAULT_TECH_TARGET: Final = "iot.solinteg-tech.com:5743"
+DEFAULT_TECH_LISTEN_PORT: Final = 5744
 MESSAGE_TYPE_DESCRIPTIONS: Final = {
     b"\x01\x03": "device/configuration register snapshot",
     b"\x01\x04": "current full telemetry snapshot",
@@ -260,7 +267,12 @@ def parse_register_snapshot(
     return snapshot_time, tuple(ranges), frame[cursor:data_end]
 
 
-def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) -> None:
+def log_register_snapshot(
+    endpoint_name: str,
+    frame_number: int,
+    message_type: bytes,
+    frame: bytes,
+) -> None:
     """Log every register word, decoded with the Modbus Broker v5.12 map."""
 
     type_text = message_type.hex(":")
@@ -268,7 +280,8 @@ def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) 
         snapshot_time, ranges, padding = parse_register_snapshot(frame)
     except ValueError as error:
         logging.warning(
-            "frame %d type=%s register snapshot could not be decoded: %s",
+            "[%s] frame %d type=%s register snapshot could not be decoded: %s",
+            endpoint_name,
             frame_number,
             type_text,
             error,
@@ -276,7 +289,8 @@ def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) 
         return
 
     logging.info(
-        "frame %d type=%s register snapshot: time=%s ranges=%d",
+        "[%s] frame %d type=%s register snapshot: time=%s ranges=%d",
+        endpoint_name,
         frame_number,
         type_text,
         snapshot_time,
@@ -288,8 +302,9 @@ def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) 
             register_range.values,
         ):
             logging.info(
-                "frame %d type=%s snapshot=%s range=%d/%d register=%d "
+                "[%s] frame %d type=%s snapshot=%s range=%d/%d register=%d "
                 "name=%r raw=%s value=%r",
+                endpoint_name,
                 frame_number,
                 type_text,
                 snapshot_time,
@@ -303,7 +318,9 @@ def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) 
 
     if padding and any(value != 0xFF for value in padding):
         logging.warning(
-            "frame %d type=%s has %d trailing byte(s), including non-FF data: %s",
+            "[%s] frame %d type=%s has %d trailing byte(s), including "
+            "non-FF data: %s",
+            endpoint_name,
             frame_number,
             type_text,
             len(padding),
@@ -313,6 +330,7 @@ def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) 
 
 def append_unknown_frame(
     log_file: Path,
+    endpoint_name: str,
     peer: str,
     frame_number: int,
     message_type: bytes,
@@ -323,6 +341,7 @@ def append_unknown_frame(
     record = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "direction": "inverter_to_cloud",
+        "endpoint": endpoint_name,
         "peer": peer,
         "connection_frame_number": frame_number,
         "message_type": message_type.hex(":"),
@@ -349,7 +368,8 @@ def append_unknown_frame(
                 os.close(descriptor)
     except OSError as error:
         logging.error(
-            "could not save unknown frame %d type=%s to %s: %s",
+            "[%s] could not save unknown frame %d type=%s to %s: %s",
+            endpoint_name,
             frame_number,
             message_type.hex(":"),
             log_file,
@@ -358,7 +378,8 @@ def append_unknown_frame(
         return
 
     logging.warning(
-        "unknown frame %d type=%s saved to %s (sha256=%s)",
+        "[%s] unknown frame %d type=%s saved to %s (sha256=%s)",
+        endpoint_name,
         frame_number,
         message_type.hex(":"),
         log_file,
@@ -373,7 +394,7 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
         connection: socket.socket = self.request
         connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
-        logging.info("connection opened from %s", peer)
+        logging.info("[%s] connection opened from %s", self.server.endpoint_name, peer)
 
         buffer = bytearray()
         frame_number = 0
@@ -382,7 +403,9 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
         if self.server.cloud_command_router is not None:
             command_token, command_queue = self.server.cloud_command_router.register()
             logging.warning(
-                "cloud-command forwarding armed for active inverter connection %s",
+                "[%s] cloud-command forwarding armed for active inverter "
+                "connection %s",
+                self.server.endpoint_name,
                 peer,
             )
         try:
@@ -414,13 +437,17 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
                         discarded = len(buffer) - (1 if buffer[-1:] == b"S" else 0)
                         if discarded:
                             logging.warning(
-                                "discarded %d unframed byte(s) from %s", discarded, peer
+                                "[%s] discarded %d unframed byte(s) from %s",
+                                self.server.endpoint_name,
+                                discarded,
+                                peer,
                             )
                             del buffer[:discarded]
                         break
                     if magic_offset:
                         logging.warning(
-                            "discarded %d byte(s) before ST magic from %s",
+                            "[%s] discarded %d byte(s) before ST magic from %s",
+                            self.server.endpoint_name,
                             magic_offset,
                             peer,
                         )
@@ -432,7 +459,9 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
                     total_length = frame_total_length(buffer[:6])
                     if total_length < 32 or total_length > MAX_FRAME_LENGTH:
                         logging.error(
-                            "invalid declared frame length %d from %s; resynchronising",
+                            "[%s] invalid declared frame length %d from %s; "
+                            "resynchronising",
+                            self.server.endpoint_name,
                             total_length,
                             peer,
                         )
@@ -446,14 +475,19 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
                     frame_number += 1
                     self.process_frame(connection, peer, frame_number, frame)
         except (ConnectionError, OSError, ValueError) as error:
-            logging.warning("connection error from %s: %s", peer, error)
+            logging.warning(
+                "[%s] connection error from %s: %s",
+                self.server.endpoint_name,
+                peer,
+                error,
+            )
         finally:
             if (
                 command_token is not None
                 and self.server.cloud_command_router is not None
             ):
                 self.server.cloud_command_router.unregister(command_token)
-            logging.info("connection closed from %s", peer)
+            logging.info("[%s] connection closed from %s", self.server.endpoint_name, peer)
 
     @staticmethod
     def send_cloud_commands(
@@ -486,7 +520,8 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
         valid, reason = validate_request(frame)
         if not valid:
             logging.error(
-                "frame %d from %s rejected without acknowledgement: %s",
+                "[%s] frame %d from %s rejected without acknowledgement: %s",
+                self.server.endpoint_name,
                 frame_number,
                 peer,
                 reason,
@@ -504,14 +539,16 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
         if message_type not in KNOWN_MESSAGE_TYPES:
             if self.server.strict_known_types:
                 logging.warning(
-                    "frame %d has previously unseen type %s; strict mode will not "
+                    "[%s] frame %d has previously unseen type %s; strict mode will not "
                     "acknowledge it",
+                    self.server.endpoint_name,
                     frame_number,
                     type_text,
                 )
                 if self.server.unknown_log_file is not None:
                     append_unknown_frame(
                         self.server.unknown_log_file,
+                        self.server.endpoint_name,
                         peer,
                         frame_number,
                         message_type,
@@ -529,7 +566,8 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
             self.server.cloud_forwarder.enqueue(frame)
 
         logging.info(
-            "frame %d acknowledged: type=%s (%s) serial=%s length=%d time=%s",
+            "[%s] frame %d acknowledged: type=%s (%s) serial=%s length=%d time=%s",
+            self.server.endpoint_name,
             frame_number,
             type_text,
             type_description,
@@ -540,7 +578,9 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
 
         if message_type not in KNOWN_MESSAGE_TYPES:
             logging.warning(
-                "frame %d has previously unseen type %s; serial=%s length=%d time=%s",
+                "[%s] frame %d has previously unseen type %s; serial=%s "
+                "length=%d time=%s",
+                self.server.endpoint_name,
                 frame_number,
                 type_text,
                 serial,
@@ -550,6 +590,7 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
             if self.server.unknown_log_file is not None:
                 append_unknown_frame(
                     self.server.unknown_log_file,
+                    self.server.endpoint_name,
                     peer,
                     frame_number,
                     message_type,
@@ -557,7 +598,12 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
                 )
 
         if self.server.verbose_registers:
-            log_register_snapshot(frame_number, message_type, frame)
+            log_register_snapshot(
+                self.server.endpoint_name,
+                frame_number,
+                message_type,
+                frame,
+            )
 
 
 class SolintegServer(socketserver.ThreadingTCPServer):
@@ -567,12 +613,14 @@ class SolintegServer(socketserver.ThreadingTCPServer):
     def __init__(
         self,
         server_address: tuple[str, int],
+        endpoint_name: str,
         strict_known_types: bool,
         verbose_registers: bool,
         unknown_log_file: Optional[Path],
         cloud_forwarder: Optional[CloudForwarder],
         cloud_command_router: Optional[InverterCommandRouter],
     ) -> None:
+        self.endpoint_name = endpoint_name
         self.strict_known_types = strict_known_types
         self.verbose_registers = verbose_registers
         self.unknown_log_file = unknown_log_file
@@ -813,7 +861,19 @@ def parse_args() -> argparse.Namespace:
         "--port",
         type=int,
         default=5743,
-        help="TCP port to listen on (default: 5743)",
+        help="local TCP port for iot.solinteg-cloud.com (default: 5743)",
+    )
+    parser.add_argument(
+        "--tech-port",
+        type=int,
+        default=os.environ.get(
+            "TECH_LISTEN_PORT",
+            str(DEFAULT_TECH_LISTEN_PORT),
+        ),
+        help=(
+            "local TCP port for iot.solinteg-tech.com "
+            f"(default: {DEFAULT_TECH_LISTEN_PORT})"
+        ),
     )
     parser.add_argument(
         "--strict-known-types",
@@ -844,8 +904,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         metavar="HOST:PORT",
         help=(
-            "mirror acknowledged inverter frames to the cloud through this "
-            "SOCKS5 proxy; cloud input is always logged"
+            "mirror acknowledged inverter frames to both matching remote "
+            "endpoints through this SOCKS5 proxy; server input is always logged"
         ),
     )
     parser.add_argument(
@@ -854,8 +914,8 @@ def parse_args() -> argparse.Namespace:
         dest="allow_cloud_commands",
         action="store_true",
         help=(
-            "DANGEROUS: forward cloud-initiated non-ACK frames to the active "
-            "inverter connection; telemetry ACKs remain local"
+            "DANGEROUS: forward normal-cloud non-ACK frames to the active "
+            "inverter connection; technical input and telemetry ACKs remain local"
         ),
     )
     parser.add_argument(
@@ -887,6 +947,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--tech-forward-target",
+        default=DEFAULT_TECH_TARGET,
+        metavar="HOST:PORT",
+        help=(
+            "remote technical target sent to the SOCKS5 proxy "
+            f"(default: {DEFAULT_TECH_TARGET})"
+        ),
+    )
+    parser.add_argument(
         "--cloud-incoming-log",
         type=Path,
         default=DEFAULT_CLOUD_INCOMING_LOG_FILE,
@@ -897,6 +966,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--tech-incoming-log",
+        type=Path,
+        default=DEFAULT_TECH_INCOMING_LOG_FILE,
+        metavar="PATH",
+        help=(
+            "JSON Lines file for all technical-endpoint input "
+            f"(default: {DEFAULT_TECH_INCOMING_LOG_FILE})"
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run protocol and CRC self-tests, then exit",
@@ -904,6 +983,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+    if not 1 <= args.tech_port <= 65535:
+        parser.error("--tech-port must be between 1 and 65535")
+    if args.tech_port == args.port:
+        parser.error("--tech-port must differ from --port")
     if args.forward_socks5 is not None:
         try:
             args.forward_socks5 = parse_endpoint(args.forward_socks5)
@@ -928,6 +1011,10 @@ def parse_args() -> argparse.Namespace:
         args.forward_target = parse_endpoint(args.forward_target)
     except ValueError as error:
         parser.error(f"invalid --forward-target value: {error}")
+    try:
+        args.tech_forward_target = parse_endpoint(args.tech_forward_target)
+    except ValueError as error:
+        parser.error(f"invalid --tech-forward-target value: {error}")
     return args
 
 
@@ -940,6 +1027,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cloud_forwarder: Optional[CloudForwarder] = None
+    tech_forwarder: Optional[CloudForwarder] = None
     cloud_command_router: Optional[InverterCommandRouter] = None
     if args.allow_cloud_commands:
         cloud_command_router = InverterCommandRouter()
@@ -967,10 +1055,22 @@ def main() -> int:
             fake_ack_cloud_writes=args.fake_ack_cloud_commands,
             shadow_retention_seconds=args.cloud_shadow_retention,
         )
+        # The technical endpoint is deliberately isolated from cloud command
+        # routing and fake-write acknowledgements. Its server input is logged
+        # but never delivered to the inverter.
+        tech_forwarder = CloudForwarder(
+            proxy=args.forward_socks5,
+            target=args.tech_forward_target,
+            incoming_log_file=args.tech_incoming_log,
+            username=username if username else None,
+            password=password,
+            verbose_registers=args.verbose,
+        )
 
     try:
-        server = SolintegServer(
+        cloud_server = SolintegServer(
             (args.bind, args.port),
+            "cloud",
             args.strict_known_types,
             args.verbose,
             args.log_unknown,
@@ -981,6 +1081,28 @@ def main() -> int:
         logging.error("cannot listen on %s:%d: %s", args.bind, args.port, error)
         return 1
 
+    try:
+        tech_server = SolintegServer(
+            (args.bind, args.tech_port),
+            "tech",
+            args.strict_known_types,
+            args.verbose,
+            args.log_unknown,
+            tech_forwarder,
+            None,
+        )
+    except OSError as error:
+        cloud_server.server_close()
+        logging.error(
+            "cannot listen on technical endpoint %s:%d: %s",
+            args.bind,
+            args.tech_port,
+            error,
+        )
+        return 1
+
+    servers = (cloud_server, tech_server)
+
     stop_once = threading.Event()
 
     def request_shutdown(signum: int, _frame: object) -> None:
@@ -988,13 +1110,20 @@ def main() -> int:
             return
         stop_once.set()
         logging.info("received signal %d; shutting down", signum)
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        def shutdown_servers() -> None:
+            for active_server in servers:
+                active_server.shutdown()
+
+        threading.Thread(target=shutdown_servers, daemon=True).start()
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
     if cloud_forwarder is not None:
         cloud_forwarder.start()
+        if tech_forwarder is None:
+            raise AssertionError("technical forwarder was not created")
+        tech_forwarder.start()
         if args.allow_cloud_commands:
             logging.warning(
                 "FULL CLOUD COMMAND COMMUNICATION ENABLED: proxy=%s target=%s "
@@ -1022,23 +1151,45 @@ def main() -> int:
                 args.forward_target,
                 args.cloud_incoming_log,
             )
+        logging.info(
+            "SOCKS5 technical mirror enabled: proxy=%s target=%s incoming=%s; "
+            "all technical-server input will be logged and ignored",
+            args.forward_socks5,
+            args.tech_forward_target,
+            args.tech_incoming_log,
+        )
     else:
-        logging.info("SOCKS5 cloud mirror disabled")
+        logging.info("SOCKS5 cloud and technical mirrors disabled")
 
     logging.info(
-        "Solinteg simulator listening on %s:%d; strict=%s verbose=%s log_unknown=%s",
+        "Solinteg simulator listening on cloud=%s:%d tech=%s:%d; "
+        "strict=%s verbose=%s log_unknown=%s",
         args.bind,
         args.port,
+        args.bind,
+        args.tech_port,
         args.strict_known_types,
         args.verbose,
         args.log_unknown if args.log_unknown is not None else "off",
     )
+    tech_thread = threading.Thread(
+        target=tech_server.serve_forever,
+        kwargs={"poll_interval": 0.5},
+        name="solinteg-tech-listener",
+        daemon=True,
+    )
+    tech_thread.start()
     try:
-        server.serve_forever(poll_interval=0.5)
+        cloud_server.serve_forever(poll_interval=0.5)
     finally:
-        server.server_close()
+        tech_server.shutdown()
+        tech_thread.join(timeout=2.0)
+        for active_server in servers:
+            active_server.server_close()
         if cloud_forwarder is not None:
             cloud_forwarder.stop()
+        if tech_forwarder is not None:
+            tech_forwarder.stop()
     logging.info("Solinteg simulator stopped")
     return 0
 
