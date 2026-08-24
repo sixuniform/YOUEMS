@@ -8,7 +8,8 @@ redirects the inverter communication module's connection to
 8.211.16.247:5743 onto this host.  It validates each incoming ST frame and
 returns the 58-byte application acknowledgement observed from the real
 Solinteg server.  An optional isolated worker can mirror acknowledged frames
-to the real endpoint through SOCKS5; cloud input is logged and ignored.
+to the real endpoint through SOCKS5. Cloud input is always logged and is
+ignored unless explicit command-forwarding test mode is enabled.
 
 Observed request families: 01:03, 01:04, and 01:44.
 
@@ -25,6 +26,8 @@ import hashlib
 import json
 import logging
 import os
+import queue
+import select
 import signal
 import socket
 import socketserver
@@ -36,7 +39,7 @@ from pathlib import Path
 from typing import Final, NamedTuple, Optional
 
 from solinteg_modbus_map import decode_register_range
-from solinteg_cloud_forwarder import CloudForwarder, parse_endpoint
+from solinteg_cloud_forwarder import CloudForwarder, parse_cloud_write, parse_endpoint
 
 
 MAGIC: Final = b"ST"
@@ -57,6 +60,8 @@ MESSAGE_TYPE_DESCRIPTIONS: Final = {
 }
 KNOWN_MESSAGE_TYPES: Final = frozenset(MESSAGE_TYPE_DESCRIPTIONS)
 UNKNOWN_LOG_LOCK: Final = threading.Lock()
+CLOUD_COMMAND_QUEUE_SIZE: Final = 64
+MAX_CLOUD_COMMANDS_PER_CYCLE: Final = 8
 
 
 class RegisterRange(NamedTuple):
@@ -65,6 +70,53 @@ class RegisterRange(NamedTuple):
     start: int
     end: int
     values: tuple[int, ...]
+
+
+class InverterCommandRouter:
+    """Non-blocking handoff from the cloud worker to the active LAN session."""
+
+    def __init__(self, queue_size: int = CLOUD_COMMAND_QUEUE_SIZE) -> None:
+        self.queue_size = queue_size
+        self._lock = threading.Lock()
+        self._active_token: Optional[object] = None
+        self._active_queue: Optional[queue.Queue[bytes]] = None
+
+    def register(self) -> tuple[object, queue.Queue[bytes]]:
+        token = object()
+        command_queue: queue.Queue[bytes] = queue.Queue(maxsize=self.queue_size)
+        with self._lock:
+            self._active_token = token
+            self._active_queue = command_queue
+        return token, command_queue
+
+    def unregister(self, token: object) -> None:
+        with self._lock:
+            if token is self._active_token:
+                self._active_token = None
+                self._active_queue = None
+
+    def deliver(self, frame: bytes) -> str:
+        """Queue a cloud frame without performing socket or file operations."""
+
+        with self._lock:
+            command_queue = self._active_queue
+        if command_queue is None:
+            return "ignored_no_inverter_connection"
+        try:
+            command_queue.put_nowait(frame)
+            return "queued_for_inverter"
+        except queue.Full:
+            pass
+
+        try:
+            command_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            command_queue.put_nowait(frame)
+            return "queued_for_inverter_replaced_stale"
+        except queue.Full:
+            return "ignored_inverter_queue_full"
 
 
 def make_crc16_table() -> tuple[int, ...]:
@@ -262,6 +314,7 @@ def append_unknown_frame(
 
     record = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
+        "direction": "inverter_to_cloud",
         "peer": peer,
         "connection_frame_number": frame_number,
         "message_type": message_type.hex(":"),
@@ -316,8 +369,26 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
 
         buffer = bytearray()
         frame_number = 0
+        command_token: Optional[object] = None
+        command_queue: Optional[queue.Queue[bytes]] = None
+        if self.server.cloud_command_router is not None:
+            command_token, command_queue = self.server.cloud_command_router.register()
+            logging.warning(
+                "cloud-command forwarding armed for active inverter connection %s",
+                peer,
+            )
         try:
             while True:
+                if command_queue is not None:
+                    self.send_cloud_commands(connection, peer, command_queue)
+                    readable, _writable, _exceptional = select.select(
+                        [connection], [], [connection], 0.1
+                    )
+                    if connection in _exceptional:
+                        raise ConnectionError("inverter socket exception")
+                    if connection not in readable:
+                        continue
+
                 # The module may legitimately keep this connection idle for five
                 # minutes or longer.  Leave session lifetime entirely to the peer;
                 # a local idle timeout would recreate the failure we are avoiding.
@@ -366,10 +437,36 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
                     del buffer[:total_length]
                     frame_number += 1
                     self.process_frame(connection, peer, frame_number, frame)
-        except (ConnectionError, OSError) as error:
+        except (ConnectionError, OSError, ValueError) as error:
             logging.warning("connection error from %s: %s", peer, error)
         finally:
+            if (
+                command_token is not None
+                and self.server.cloud_command_router is not None
+            ):
+                self.server.cloud_command_router.unregister(command_token)
             logging.info("connection closed from %s", peer)
+
+    @staticmethod
+    def send_cloud_commands(
+        connection: socket.socket,
+        peer: str,
+        command_queue: queue.Queue[bytes],
+    ) -> None:
+        """Deliver queued commands from the handler thread that owns the socket."""
+
+        for _command_number in range(MAX_CLOUD_COMMANDS_PER_CYCLE):
+            try:
+                frame = command_queue.get_nowait()
+            except queue.Empty:
+                return
+            connection.sendall(frame)
+            logging.warning(
+                "cloud frame delivered to inverter %s: type=%s length=%d",
+                peer,
+                frame[6:8].hex(":") if len(frame) >= 8 else "unknown",
+                len(frame),
+            )
 
     def process_frame(
         self,
@@ -466,11 +563,13 @@ class SolintegServer(socketserver.ThreadingTCPServer):
         verbose_registers: bool,
         unknown_log_file: Optional[Path],
         cloud_forwarder: Optional[CloudForwarder],
+        cloud_command_router: Optional[InverterCommandRouter],
     ) -> None:
         self.strict_known_types = strict_known_types
         self.verbose_registers = verbose_registers
         self.unknown_log_file = unknown_log_file
         self.cloud_forwarder = cloud_forwarder
+        self.cloud_command_router = cloud_command_router
         super().__init__(server_address, SolintegRequestHandler)
 
     def server_bind(self) -> None:
@@ -526,6 +625,28 @@ def run_self_test() -> None:
         acknowledgement[-2:], "little"
     ):
         raise AssertionError("acknowledgement CRC mismatch")
+
+    cloud_write_body = b"".join(
+        (
+            MAGIC,
+            ACK_DECLARED_LENGTH.to_bytes(4, "big"),
+            b"\x01\x10",
+            serial,
+            timestamp,
+            b"\x00" * 10,
+            struct.pack(">HHH", 50009, 50009, 137),
+            b"\xff" * 10,
+        )
+    )
+    cloud_write_frame = cloud_write_body + struct.pack(
+        "<H", crc16_modbus(cloud_write_body)
+    )
+    cloud_write = parse_cloud_write(cloud_write_frame)
+    if cloud_write.start != 50009 or cloud_write.end != 50009:
+        raise AssertionError("cloud write register-range test failed")
+    decoded_limit = list(decode_register_range(cloud_write.start, cloud_write.values))
+    if len(decoded_limit) != 1 or decoded_limit[0].value != "13.7 kW":
+        raise AssertionError("cloud write register-value test failed")
     print("Self-test passed")
 
 
@@ -552,7 +673,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Decode and log every transmitted register using the Broker v5.12 table",
+        help=(
+            "decode and log inverter telemetry and incoming cloud writes using "
+            "the Broker v5.12 table"
+        ),
     )
     parser.add_argument(
         "--log-unknown",
@@ -571,7 +695,17 @@ def parse_args() -> argparse.Namespace:
         metavar="HOST:PORT",
         help=(
             "mirror acknowledged inverter frames to the cloud through this "
-            "SOCKS5 proxy; cloud replies are logged and ignored"
+            "SOCKS5 proxy; cloud input is always logged"
+        ),
+    )
+    parser.add_argument(
+        "--allow-cloud-commands",
+        "--allow-full-communication",
+        dest="allow_cloud_commands",
+        action="store_true",
+        help=(
+            "DANGEROUS: forward cloud-initiated non-ACK frames to the active "
+            "inverter connection; telemetry ACKs remain local"
         ),
     )
     parser.add_argument(
@@ -589,7 +723,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CLOUD_INCOMING_LOG_FILE,
         metavar="PATH",
         help=(
-            "JSON Lines file for ignored cloud input "
+            "JSON Lines file for all cloud input "
             f"(default: {DEFAULT_CLOUD_INCOMING_LOG_FILE})"
         ),
     )
@@ -606,6 +740,12 @@ def parse_args() -> argparse.Namespace:
             args.forward_socks5 = parse_endpoint(args.forward_socks5)
         except ValueError as error:
             parser.error(f"invalid --forward-socks5 value: {error}")
+    if args.allow_cloud_commands and args.forward_socks5 is None:
+        parser.error("--allow-cloud-commands requires --forward-socks5")
+    if args.allow_cloud_commands and args.strict_known_types:
+        parser.error(
+            "--allow-cloud-commands cannot be combined with --strict-known-types"
+        )
     try:
         args.forward_target = parse_endpoint(args.forward_target)
     except ValueError as error:
@@ -622,6 +762,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cloud_forwarder: Optional[CloudForwarder] = None
+    cloud_command_router: Optional[InverterCommandRouter] = None
+    if args.allow_cloud_commands:
+        cloud_command_router = InverterCommandRouter()
     if args.forward_socks5 is not None:
         username = os.environ.get("SOLINTEG_SOCKS5_USERNAME")
         password = os.environ.get("SOLINTEG_SOCKS5_PASSWORD")
@@ -637,6 +780,12 @@ def main() -> int:
             incoming_log_file=args.cloud_incoming_log,
             username=username if username else None,
             password=password,
+            verbose_registers=args.verbose,
+            incoming_handler=(
+                cloud_command_router.deliver
+                if cloud_command_router is not None
+                else None
+            ),
         )
 
     try:
@@ -646,6 +795,7 @@ def main() -> int:
             args.verbose,
             args.log_unknown,
             cloud_forwarder,
+            cloud_command_router,
         )
     except OSError as error:
         logging.error("cannot listen on %s:%d: %s", args.bind, args.port, error)
@@ -665,13 +815,22 @@ def main() -> int:
 
     if cloud_forwarder is not None:
         cloud_forwarder.start()
-        logging.info(
-            "SOCKS5 cloud mirror enabled: proxy=%s target=%s incoming=%s; "
-            "all cloud input will be logged and ignored",
-            args.forward_socks5,
-            args.forward_target,
-            args.cloud_incoming_log,
-        )
+        if args.allow_cloud_commands:
+            logging.warning(
+                "FULL CLOUD COMMAND COMMUNICATION ENABLED: proxy=%s target=%s "
+                "incoming=%s; non-ACK cloud frames can control the inverter",
+                args.forward_socks5,
+                args.forward_target,
+                args.cloud_incoming_log,
+            )
+        else:
+            logging.info(
+                "SOCKS5 cloud mirror enabled: proxy=%s target=%s incoming=%s; "
+                "all cloud input will be logged and ignored",
+                args.forward_socks5,
+                args.forward_target,
+                args.cloud_incoming_log,
+            )
     else:
         logging.info("SOCKS5 cloud mirror disabled")
 

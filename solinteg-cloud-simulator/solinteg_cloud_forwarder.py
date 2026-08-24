@@ -3,9 +3,10 @@
 # Copyright 2026 Rickard Dahlstedt
 """Asynchronous SOCKS5 cloud mirror for solinteg-cloud-simulator.
 
-All network and file operations in this module run in a dedicated daemon
-thread.  The simulator's inverter-facing request handler only performs a
-bounded, non-blocking queue insertion after it has sent the local reply.
+All SOCKS, cloud, and file operations in this module run in a dedicated daemon
+thread. The cloud thread can reach the LAN side only through a bounded,
+non-blocking callback; the inverter-facing handler retains ownership of its
+socket and sends the local acknowledgement before queuing outgoing telemetry.
 """
 
 from __future__ import annotations
@@ -23,7 +24,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, NamedTuple, Optional
+from typing import Callable, Final, NamedTuple, Optional
+
+from solinteg_modbus_map import decode_register_range
 
 
 MAGIC: Final = b"ST"
@@ -32,6 +35,10 @@ DEFAULT_QUEUE_SIZE: Final = 256
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 SELECT_TIMEOUT_SECONDS: Final = 0.25
 MAX_RECONNECT_DELAY_SECONDS: Final = 30.0
+CLOUD_TELEMETRY_ACK_TYPES: Final = frozenset(
+    (b"\x01\x03", b"\x01\x04", b"\x01\x44")
+)
+CLOUD_WRITE_TYPE: Final = b"\x01\x10"
 
 
 class Endpoint(NamedTuple):
@@ -42,6 +49,34 @@ class Endpoint(NamedTuple):
         if ":" in self.host:
             return f"[{self.host}]:{self.port}"
         return f"{self.host}:{self.port}"
+
+
+class CloudWrite(NamedTuple):
+    """One register range carried by a cloud 01:10 command."""
+
+    start: int
+    end: int
+    values: tuple[int, ...]
+    padding: bytes
+
+
+def parse_cloud_write(frame: bytes) -> CloudWrite:
+    """Decode the Modbus-style register range in a cloud 01:10 frame."""
+
+    if len(frame) < 46 or frame[:2] != MAGIC or frame[6:8] != CLOUD_WRITE_TYPE:
+        raise ValueError("not a complete cloud 01:10 write frame")
+    start, end = struct.unpack_from(">HH", frame, 40)
+    if end < start:
+        raise ValueError(f"descending register range {start}..{end}")
+    register_count = end - start + 1
+    values_end = 44 + register_count * 2
+    data_end = len(frame) - 2
+    if values_end > data_end:
+        raise ValueError(
+            f"register range {start}..{end} extends past command data"
+        )
+    values = struct.unpack_from(f">{register_count}H", frame, 44)
+    return CloudWrite(start, end, values, frame[values_end:data_end])
 
 
 def parse_endpoint(value: str) -> Endpoint:
@@ -197,12 +232,16 @@ class CloudForwarder:
         username: Optional[str] = None,
         password: Optional[str] = None,
         queue_size: int = DEFAULT_QUEUE_SIZE,
+        verbose_registers: bool = False,
+        incoming_handler: Optional[Callable[[bytes], str]] = None,
     ) -> None:
         self.proxy = proxy
         self.target = target
         self.incoming_log_file = incoming_log_file
         self.username = username
         self.password = password
+        self.verbose_registers = verbose_registers
+        self.incoming_handler = incoming_handler
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_size)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -239,11 +278,16 @@ class CloudForwarder:
         except queue.Full:
             self._dropped_frames += 1
 
-    def _append_incoming(self, kind: str, payload: bytes) -> None:
+    def _append_incoming(
+        self,
+        kind: str,
+        payload: bytes,
+        action: str = "ignored",
+    ) -> None:
         record = {
             "received_at": datetime.now(timezone.utc).isoformat(),
             "direction": "cloud_to_inverter",
-            "action": "ignored",
+            "action": action,
             "kind": kind,
             "target": str(self.target),
             "length": len(payload),
@@ -273,16 +317,21 @@ class CloudForwarder:
             finally:
                 os.close(descriptor)
         except OSError as error:
-            logging.error("could not save ignored cloud input: %s", error)
+            logging.error("could not save cloud input: %s", error)
             return
 
         if kind == "st_frame":
-            logging.info(
-                "cloud frame ignored and logged: type=%s length=%d sha256=%s",
-                record.get("message_type", "unknown"),
-                len(payload),
-                record["sha256"],
-            )
+            message_type = payload[6:8] if len(payload) >= 8 else b""
+            if message_type == CLOUD_WRITE_TYPE:
+                self._log_cloud_write(payload, action, record["sha256"])
+            else:
+                logging.info(
+                    "cloud frame %s and logged: type=%s length=%d sha256=%s",
+                    action.replace("_", " "),
+                    record.get("message_type", "unknown"),
+                    len(payload),
+                    record["sha256"],
+                )
         else:
             logging.warning(
                 "cloud %s bytes ignored and logged: length=%d sha256=%s",
@@ -290,6 +339,63 @@ class CloudForwarder:
                 len(payload),
                 record["sha256"],
             )
+
+    def _log_cloud_write(self, frame: bytes, action: str, sha256: str) -> None:
+        try:
+            command = parse_cloud_write(frame)
+        except ValueError as error:
+            logging.warning(
+                "cloud type=01:10 frame %s and logged but could not be decoded: "
+                "%s sha256=%s",
+                action.replace("_", " "),
+                error,
+                sha256,
+            )
+            return
+
+        logging.warning(
+            "cloud write %s and logged: registers=%d..%d count=%d sha256=%s",
+            action.replace("_", " "),
+            command.start,
+            command.end,
+            len(command.values),
+            sha256,
+        )
+        if self.verbose_registers:
+            for decoded in decode_register_range(command.start, command.values):
+                logging.info(
+                    "cloud write action=%s register=%d name=%r raw=%s value=%r",
+                    action,
+                    decoded.address,
+                    decoded.name,
+                    list(decoded.raw_words),
+                    decoded.value,
+                )
+        if command.padding and any(value != 0xFF for value in command.padding):
+            logging.warning(
+                "cloud write registers=%d..%d has %d padding byte(s), including "
+                "non-FF data: %s",
+                command.start,
+                command.end,
+                len(command.padding),
+                command.padding.hex(),
+            )
+
+    def _route_cloud_frame(self, frame: bytes) -> str:
+        message_type = frame[6:8] if len(frame) >= 8 else b""
+        if len(frame) < 2 or _crc16_modbus(frame[:-2]) != int.from_bytes(
+            frame[-2:], "little"
+        ):
+            return "ignored_invalid_crc"
+        if message_type in CLOUD_TELEMETRY_ACK_TYPES:
+            return "ignored_local_ack_already_sent"
+        if self.incoming_handler is None:
+            return "ignored"
+        try:
+            return self.incoming_handler(frame)
+        except Exception as error:
+            logging.error("cloud input router failed; frame ignored: %s", error)
+            return "ignored_router_error"
 
     def _consume_incoming(self, buffer: bytearray) -> None:
         while buffer:
@@ -316,7 +422,11 @@ class CloudForwarder:
                 return
             frame = bytes(buffer[:total_length])
             del buffer[:total_length]
-            self._append_incoming("st_frame", frame)
+            self._append_incoming(
+                "st_frame",
+                frame,
+                self._route_cloud_frame(frame),
+            )
 
     def _close_connection(
         self,

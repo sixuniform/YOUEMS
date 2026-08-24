@@ -10,8 +10,9 @@ was observed from the real server.
 
 It can optionally mirror a copy of each acknowledged inverter frame to the
 real cloud through a SOCKS5 proxy. This forwarding path is deliberately
-one-way: bytes received from the cloud are logged and ignored, never delivered
-to the inverter.
+one-way by default: bytes received from the cloud are logged and ignored. A
+separate, explicit test switch can temporarily forward cloud commands while
+their real inverter responses are being reverse engineered.
 
 This is **not** a Modbus simulator. It does not read or write inverter
 registers. Its purpose is to keep cloud telemetry work from blocking the
@@ -87,6 +88,7 @@ from this document.
 - The final two bytes are CRC-16/Modbus in little-endian wire order.
 - The real server returns a deterministic 58-byte acknowledgement.
 - Captured request types were `01:03`, `01:04`, and `01:44`.
+- Captured cloud write commands use type `01:10`.
 - The generated replies matched all 17 captured genuine server replies exactly.
 - Reply generation took approximately 0.077 ms during development testing.
 
@@ -155,9 +157,46 @@ the current time. This is strong evidence that the communication module uses
 unavailable.
 
 The type numbers resemble Modbus function codes, but that relationship has not
-been proven. They should be treated as cloud-protocol message types. Solinteg's
-published external Modbus RTU protocol documents functions `03`, `06`, and
-`16`, while these cloud frames use their own batching format.
+been proven for every family. The decoded `01:10` cloud writes are strong
+evidence that the first byte is unit/device `01` and the second byte is a
+Modbus-like function code: `10` is hexadecimal function 16, Write Multiple
+Registers. The `ST` protocol is still not a raw Modbus RTU or Modbus TCP frame;
+it uses its own envelope, range encoding, padding, timestamps, and CRC scope.
+
+### Cloud register-write commands (`01:10`)
+
+Controlled cloud-UI tests confirmed this frame layout:
+
+| Offset | Size | Meaning |
+|---:|---:|---|
+| 0 | 2 bytes | `ST` magic |
+| 2 | 4 bytes | Big-endian declared length |
+| 6 | 2 bytes | `01:10` message type |
+| 8 | 16 bytes | Communication-module identifier |
+| 24 | 6 bytes | Outer command timestamp |
+| 30 | 10 bytes | Reserved; zero in observed commands |
+| 40 | 2 bytes | First target register, big-endian |
+| 42 | 2 bytes | Last target register, inclusive, big-endian |
+| 44 | Variable | One big-endian U16 value per target register |
+| Variable | Variable | `FF` padding |
+| Final | 2 bytes | CRC-16/Modbus, low byte first |
+
+The following commands were identified without allowing them to reach the
+inverter:
+
+| Register(s) | Decoded purpose |
+|---:|---|
+| `20000–20002` | Automatic inverter real-time-clock synchronization |
+| `25009` | Inverter restart |
+| `50000` | Working-mode selection |
+| `50007` | Import-limit switch |
+| `50009` | Import-limit value, scaled by 0.1 kW |
+
+The captured clock command encoded the exact local date and time in three
+packed registers. Controlled working-mode, restart, and import-limit changes
+then matched the existing Broker v5.12 register names, enum values, and scale
+exactly. An identical mode command was observed more than once, consistent
+with the cloud retrying when its command received no inverter acknowledgement.
 
 ### Relationship to the Modbus delays
 
@@ -266,11 +305,12 @@ mirroring is also queued only after that reply has been sent.
 
 ### `--verbose`
 
-This logs every register snapshot sent by the inverter. Fields known to Modbus
-Broker v5.12 are logged with register address, name, raw register word(s),
-translated value, scale, unit, enum, or active flags as applicable. Every
-unmapped register word is still logged as `Raw Field`, so no transmitted
-register value is silently omitted.
+This logs every register snapshot sent by the inverter and decodes every
+incoming `01:10` cloud write. Fields known to Modbus Broker v5.12 are logged
+with register address, name, raw register word(s), translated value, scale,
+unit, enum, or active flags as applicable. Every unmapped register word is
+still logged as `Raw Field`, so no transmitted or commanded register value is
+silently omitted.
 
 Example for a manual foreground run:
 
@@ -317,7 +357,8 @@ to `iot.solinteg-cloud.com:5743`:
 SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080"
 ```
 
-The implementation is intentionally not a transparent bidirectional proxy:
+The default implementation is intentionally not a transparent bidirectional
+proxy:
 
 1. The simulator validates the inverter frame.
 2. It sends the deterministic local acknowledgement to the inverter.
@@ -325,8 +366,8 @@ The implementation is intentionally not a transparent bidirectional proxy:
    queue.
 4. A separate thread opens a long-lived SOCKS5 connection and forwards queued
    frames in order.
-5. Everything received from the cloud is logged and ignored. There is no code
-   path from the cloud socket to an inverter socket.
+5. Everything received from the cloud is logged. Telemetry acknowledgements
+   and commands are ignored unless command forwarding is explicitly enabled.
 
 The queue holds at most 256 frames. If the remote route remains unavailable
 long enough to fill it, the oldest telemetry is discarded in favour of newer
@@ -355,7 +396,7 @@ SOLINTEG_SOCKS5_PASSWORD=example-password
 Omit both variables for a proxy that authenticates by VPN or source network.
 SOCKS5 no-auth and RFC 1929 username/password authentication are supported.
 
-### Ignored cloud-input log
+### Cloud-input log
 
 Every complete `ST` frame received from the real cloud is appended to:
 
@@ -365,10 +406,12 @@ Every complete `ST` frame received from the real cloud is appended to:
 
 Unframed or partial bytes are saved as their own records, so input is not
 silently lost when the remote connection closes or a new server message format
-appears. Each JSON Lines record contains receive time, direction,
-`action=ignored`, record kind, target, length, SHA-256, and the complete bytes
-as base64. Recognised `ST` framing also records the two-byte type and CRC
-validity. The path can be changed with `--cloud-incoming-log PATH`.
+appears. Each JSON Lines record contains receive time, direction, action,
+record kind, target, length, SHA-256, and the complete bytes as base64.
+Recognised `ST` framing also records the two-byte type and CRC validity. The
+action distinguishes ignored local acknowledgements, blocked commands,
+commands queued for the inverter, invalid input, and routing failures. The
+path can be changed with `--cloud-incoming-log PATH`.
 
 To reconstruct the newest cloud frame:
 
@@ -379,9 +422,41 @@ sudo tail -n 1 \
   | base64 -d > ignored-solinteg-cloud-frame.bin
 ```
 
-The normal 58-byte cloud acknowledgements are included. Any future remote
-control or configuration message will likewise be recorded and ignored by
-this first implementation.
+The normal 58-byte cloud acknowledgements are included. Remote control and
+configuration messages are recorded whether blocked or forwarded.
+
+### Opt-in full command communication
+
+To learn the inverter's genuine response to cloud writes, temporarily enable:
+
+```bash
+python3 solinteg-cloud-simulator.py \
+  --bind 192.168.10.50 --port 5743 \
+  --forward-socks5 192.168.0.1:1080 \
+  --allow-cloud-commands --verbose --log-unknown
+```
+
+`--allow-full-communication` is accepted as an alias. In this mode:
+
+- normal `01:03`, `01:04`, and `01:44` cloud acknowledgements remain blocked,
+  because their corresponding local acknowledgements were already delivered;
+- valid cloud-initiated frames such as `01:10` are queued to the currently
+  active inverter TCP connection;
+- the inverter-facing handler owns all writes to that LAN socket, so the SOCKS
+  worker never writes to it or blocks the local ACK path;
+- the inverter's resulting response is processed and mirrored back to the
+  cloud like any other outgoing frame;
+- `--log-unknown` saves previously unseen inverter response types for analysis.
+
+This test mode permits real remote operations, including working-mode changes,
+restart commands, and power-limit changes. It is disabled by default and is
+incompatible with `--strict-known-types`. Stop the process and restart without
+`--allow-cloud-commands` to return immediately to log-and-ignore operation.
+
+No fabricated acknowledgement is currently sent to the cloud. The purpose of
+this mode is to capture genuine inverter acknowledgements first, so a later
+fake-ACK implementation can reproduce them exactly while keeping commands
+blocked.
 
 ## Enabling options under systemd
 
@@ -480,18 +555,19 @@ regions, or future cloud protocol revisions may behave differently.
 
 With cloud mirroring disabled, redirecting the endpoint disables delivery of
 the intercepted telemetry to the vendor. With mirroring enabled, telemetry is
-sent but cloud-to-inverter messages are deliberately suppressed. Either mode
-may affect cloud monitoring, remote diagnostics, controls, firmware services,
-warranty support, or safety notifications. Keep local monitoring and a tested
-rollback path. Do not expose the simulator listener or SOCKS proxy to untrusted
-networks.
+sent but cloud-to-inverter messages are suppressed by default. Enabling
+`--allow-cloud-commands` permits the vendor cloud to perform real register
+writes on the inverter. These modes may affect cloud monitoring, remote
+diagnostics, controls, firmware services, warranty support, or safety
+notifications. Keep local monitoring and a tested rollback path. Do not expose
+the simulator listener or SOCKS proxy to untrusted networks.
 
 The simulator normally logs the communication-module serial number, message
 type, frame length, and device timestamp to the system journal. `--verbose`
 adds decoded live measurements to that journal. `--log-unknown` writes complete
 unknown frames to disk; those frames can contain identifiers, configuration,
-and live measurements. The cloud-input log contains every ignored server
-reply and may contain control or account-related data. Treat diagnostic logs
+and live measurements. The cloud-input log contains every server reply or
+command and may contain control or account-related data. Treat diagnostic logs
 as private and scrub them before sharing.
 
 This project is not affiliated with or endorsed by Solinteg. Solinteg is a
