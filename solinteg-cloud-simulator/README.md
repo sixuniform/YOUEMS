@@ -199,9 +199,9 @@ python3 probe-undocumented-registers.py \
 
 For this interface the correct Modbus TCP unit ID is `255`. Although register
 `20012` has been observed with value `247`, reads addressed to unit `255` work
-and the Broker passes that unit unchanged to the inverter. The frequently
-repeated claim that clients should use unit `247` appears to come from
-misidentifying register `20012`; its actual purpose remains unknown.
+and the Broker passes that unit unchanged to the inverter. Register `20012`
+must therefore not be used as evidence that Modbus TCP clients should address
+unit `247`; its actual purpose remains unknown.
 
 The raw word dump is followed by tentative interpretations and comparisons.
 The three credential-like fields are represented only by length and a short
