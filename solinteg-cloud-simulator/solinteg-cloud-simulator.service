@@ -14,7 +14,7 @@ Type=simple
 DynamicUser=yes
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/default/solinteg-cloud-simulator
-ExecStart=/usr/bin/python3 /opt/solinteg-cloud-simulator/solinteg-cloud-simulator.py --bind ${SIMULATOR_ADDRESS} --port ${LISTEN_PORT}
+ExecStart=/usr/bin/python3 /opt/solinteg-cloud-simulator/solinteg-cloud-simulator.py --bind ${SIMULATOR_ADDRESS} --port ${LISTEN_PORT} $SIMULATOR_OPTIONS
 Restart=always
 RestartSec=1
 TimeoutStopSec=10
@@ -37,6 +37,8 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 UMask=0077
+LogsDirectory=solinteg-cloud-simulator
+LogsDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

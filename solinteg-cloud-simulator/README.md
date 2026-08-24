@@ -12,8 +12,9 @@ This is **not** a Modbus simulator. It does not read or write inverter
 registers. Its purpose is to keep cloud telemetry work from blocking the
 communication module and, indirectly, delaying local Modbus TCP traffic.
 
-The simulator does not forward traffic to Solinteg, save telemetry payloads,
-or deliberately delay replies.
+The simulator does not forward traffic to Solinteg or deliberately delay
+replies. It saves no telemetry payloads unless the optional unknown-frame
+logger is explicitly enabled.
 
 ## Why this exists
 
@@ -115,6 +116,13 @@ counters, battery state, limits, temperatures, and diagnostic fields. No
 captured identifier, manufacturer string, or measurement is required to
 describe or reproduce the packet structure.
 
+The simulator includes the complete translation metadata from Modbus Broker
+v5.12. That table combines the current Home Assistant Solinteg plugin with
+Solinteg protocol v00.02 and covers unsigned and signed 16/32-bit values,
+scaling, units, strings, versions, packed date/time fields, enums, alarm/status
+bits, and the BMS status word. The optional verbose logger applies those same
+translations directly to every register range carried by the cloud frame.
+
 ### Known request types
 
 | Type | Observed size | Register records | Register values | Observed purpose |
@@ -177,6 +185,7 @@ SIMULATOR_ADDRESS=192.168.10.50
 INVERTER_ADDRESS=192.168.10.99
 CLOUD_ADDRESS=8.211.16.247
 LISTEN_PORT=5743
+SIMULATOR_OPTIONS=
 ```
 
 1. Configure the router with a static host route:
@@ -230,6 +239,73 @@ The module may connect only about once every five minutes when communication
 is healthy, and it may keep a TCP connection open between transmissions. The
 simulator therefore has no artificial response delay and no idle socket
 timeout. Seeing no new connection for a few minutes is not by itself a fault.
+
+## Logging options
+
+Both diagnostic modes run only after the protocol acknowledgement has been
+sent. Decoding and file I/O therefore do not delay the cloud reply.
+
+### `--verbose`
+
+This logs every register snapshot sent by the inverter. Fields known to Modbus
+Broker v5.12 are logged with register address, name, raw register word(s),
+translated value, scale, unit, enum, or active flags as applicable. Every
+unmapped register word is still logged as `Raw Field`, so no transmitted
+register value is silently omitted.
+
+Example for a manual foreground run:
+
+```bash
+sudo /usr/bin/python3 \
+  /opt/solinteg-cloud-simulator/solinteg-cloud-simulator.py \
+  --bind 192.168.10.50 --port 5743 --verbose
+```
+
+This can produce several hundred journal lines per telemetry frame. It is
+intended for protocol inspection, not routine operation.
+
+### `--log-unknown [PATH]`
+
+This saves only valid frames whose two-byte message type has not previously
+been identified. Known `01:03`, `01:04`, and `01:44` frames are never written
+by this option. Each unknown frame becomes one JSON Lines record containing
+capture time, peer, type, length, SHA-256, and the complete frame encoded as
+base64. The default file is:
+
+```text
+/var/log/solinteg-cloud-simulator/unknown-frames.jsonl
+```
+
+The systemd unit creates that directory with mode `0700`; files are created
+with mode `0600`. To reconstruct the newest saved frame:
+
+```bash
+sudo tail -n 1 \
+  /var/log/solinteg-cloud-simulator/unknown-frames.jsonl \
+  | jq -r .frame_base64 \
+  | base64 -d > unknown-solinteg-frame.bin
+```
+
+An explicit alternate destination can be supplied as the next argument, for
+example `--log-unknown /tmp/unknown-frames.jsonl`.
+
+### Enabling options under systemd
+
+Set `SIMULATOR_OPTIONS` in `/etc/default/solinteg-cloud-simulator`, then restart
+the service. Use either flag independently or both together:
+
+```ini
+SIMULATOR_OPTIONS="--verbose --log-unknown"
+```
+
+```bash
+sudo systemctl restart solinteg-cloud-simulator.service
+sudo journalctl -u solinteg-cloud-simulator.service -f
+```
+
+The installer preserves an existing configuration during upgrades. If the
+file predates these options, add `SIMULATOR_OPTIONS=` to it manually before
+enabling either mode.
 
 ## Troubleshooting
 
@@ -312,9 +388,12 @@ vendor and may affect cloud monitoring, remote diagnostics, firmware services,
 warranty support, or safety notifications. Keep local monitoring and a tested
 rollback path. Do not expose the simulator listener to untrusted networks.
 
-The simulator currently logs the communication-module serial number, message
-type, frame length, and device timestamp to the system journal. It does not
-write the telemetry payload to disk.
+The simulator normally logs the communication-module serial number, message
+type, frame length, and device timestamp to the system journal. `--verbose`
+adds decoded live measurements to that journal. `--log-unknown` writes complete
+unknown frames to disk; those frames can contain identifiers, configuration,
+and live measurements. Treat diagnostic logs as private and scrub them before
+sharing.
 
 This project is not affiliated with or endorsed by Solinteg. Solinteg is a
 trademark of its respective owner.

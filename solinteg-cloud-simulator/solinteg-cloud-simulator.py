@@ -19,26 +19,46 @@ proxy setup as an immediate fallback.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import json
 import logging
+import os
 import signal
 import socket
 import socketserver
 import struct
 import sys
 import threading
-from typing import Final
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Final, NamedTuple, Optional
+
+from solinteg_modbus_map import decode_register_range
 
 
 MAGIC: Final = b"ST"
 ACK_DECLARED_LENGTH: Final = 49
 ACK_TOTAL_LENGTH: Final = 58
 MAX_FRAME_LENGTH: Final = 1024 * 1024
+DEFAULT_UNKNOWN_LOG_FILE: Final = Path(
+    "/var/log/solinteg-cloud-simulator/unknown-frames.jsonl"
+)
 MESSAGE_TYPE_DESCRIPTIONS: Final = {
     b"\x01\x03": "device/configuration register snapshot",
     b"\x01\x04": "current full telemetry snapshot",
     b"\x01\x44": "buffered historical telemetry snapshot",
 }
 KNOWN_MESSAGE_TYPES: Final = frozenset(MESSAGE_TYPE_DESCRIPTIONS)
+UNKNOWN_LOG_LOCK: Final = threading.Lock()
+
+
+class RegisterRange(NamedTuple):
+    """One contiguous register range embedded in a cloud frame."""
+
+    start: int
+    end: int
+    values: tuple[int, ...]
 
 
 def make_crc16_table() -> tuple[int, ...]:
@@ -137,6 +157,148 @@ def format_device_timestamp(raw: bytes) -> str:
     return f"20{year:02d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
 
 
+def parse_register_snapshot(
+    frame: bytes,
+) -> tuple[str, tuple[RegisterRange, ...], bytes]:
+    """Parse the sparse Modbus-register snapshot inside a valid ST frame."""
+
+    if len(frame) < 51:
+        raise ValueError("frame is too short to contain a register snapshot")
+
+    snapshot_time = format_device_timestamp(frame[42:48])
+    range_count = frame[48]
+    cursor = 49
+    data_end = len(frame) - 2
+    ranges: list[RegisterRange] = []
+
+    for record_number in range(1, range_count + 1):
+        if cursor + 4 > data_end:
+            raise ValueError(f"range {record_number} header extends past frame data")
+        start, end = struct.unpack_from(">HH", frame, cursor)
+        cursor += 4
+        if end < start:
+            raise ValueError(
+                f"range {record_number} has descending addresses {start}..{end}"
+            )
+
+        register_count = end - start + 1
+        values_end = cursor + register_count * 2
+        if values_end > data_end:
+            raise ValueError(
+                f"range {record_number} ({start}..{end}) extends past frame data"
+            )
+        values = struct.unpack_from(f">{register_count}H", frame, cursor)
+        ranges.append(RegisterRange(start, end, values))
+        cursor = values_end
+
+    return snapshot_time, tuple(ranges), frame[cursor:data_end]
+
+
+def log_register_snapshot(frame_number: int, message_type: bytes, frame: bytes) -> None:
+    """Log every register word, decoded with the Modbus Broker v5.12 map."""
+
+    type_text = message_type.hex(":")
+    try:
+        snapshot_time, ranges, padding = parse_register_snapshot(frame)
+    except ValueError as error:
+        logging.warning(
+            "frame %d type=%s register snapshot could not be decoded: %s",
+            frame_number,
+            type_text,
+            error,
+        )
+        return
+
+    logging.info(
+        "frame %d type=%s register snapshot: time=%s ranges=%d",
+        frame_number,
+        type_text,
+        snapshot_time,
+        len(ranges),
+    )
+    for range_number, register_range in enumerate(ranges, start=1):
+        for decoded in decode_register_range(
+            register_range.start,
+            register_range.values,
+        ):
+            logging.info(
+                "frame %d type=%s snapshot=%s range=%d/%d register=%d "
+                "name=%r raw=%s value=%r",
+                frame_number,
+                type_text,
+                snapshot_time,
+                range_number,
+                len(ranges),
+                decoded.address,
+                decoded.name,
+                list(decoded.raw_words),
+                decoded.value,
+            )
+
+    if padding and any(value != 0xFF for value in padding):
+        logging.warning(
+            "frame %d type=%s has %d trailing byte(s), including non-FF data: %s",
+            frame_number,
+            type_text,
+            len(padding),
+            padding.hex(),
+        )
+
+
+def append_unknown_frame(
+    log_file: Path,
+    peer: str,
+    frame_number: int,
+    message_type: bytes,
+    frame: bytes,
+) -> None:
+    """Append one valid, previously unseen frame as self-contained JSON Lines."""
+
+    record = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "peer": peer,
+        "connection_frame_number": frame_number,
+        "message_type": message_type.hex(":"),
+        "length": len(frame),
+        "sha256": hashlib.sha256(frame).hexdigest(),
+        "frame_base64": base64.b64encode(frame).decode("ascii"),
+    }
+    encoded = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+
+    try:
+        with UNKNOWN_LOG_LOCK:
+            log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(log_file, flags, 0o600)
+            try:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write while saving unknown frame")
+                    view = view[written:]
+            finally:
+                os.close(descriptor)
+    except OSError as error:
+        logging.error(
+            "could not save unknown frame %d type=%s to %s: %s",
+            frame_number,
+            message_type.hex(":"),
+            log_file,
+            error,
+        )
+        return
+
+    logging.warning(
+        "unknown frame %d type=%s saved to %s (sha256=%s)",
+        frame_number,
+        message_type.hex(":"),
+        log_file,
+        record["sha256"],
+    )
+
+
 class SolintegRequestHandler(socketserver.BaseRequestHandler):
     server: "SolintegServer"
 
@@ -229,20 +391,25 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
         device_time = format_device_timestamp(frame[26:32])
 
         if message_type not in KNOWN_MESSAGE_TYPES:
-            logging.warning(
-                "frame %d has previously unseen type %s; serial=%s length=%d time=%s",
-                frame_number,
-                type_text,
-                serial,
-                len(frame),
-                device_time,
-            )
             if self.server.strict_known_types:
                 logging.warning(
-                    "strict mode enabled: frame %d will not be acknowledged", frame_number
+                    "frame %d has previously unseen type %s; strict mode will not "
+                    "acknowledge it",
+                    frame_number,
+                    type_text,
                 )
+                if self.server.unknown_log_file is not None:
+                    append_unknown_frame(
+                        self.server.unknown_log_file,
+                        peer,
+                        frame_number,
+                        message_type,
+                        frame,
+                    )
                 return
 
+        # The acknowledgement is deliberately sent before verbose decoding or
+        # disk logging.  Diagnostic work must never delay the inverter.
         acknowledgement = build_acknowledgement(frame)
         connection.sendall(acknowledgement)
         logging.info(
@@ -255,6 +422,27 @@ class SolintegRequestHandler(socketserver.BaseRequestHandler):
             device_time,
         )
 
+        if message_type not in KNOWN_MESSAGE_TYPES:
+            logging.warning(
+                "frame %d has previously unseen type %s; serial=%s length=%d time=%s",
+                frame_number,
+                type_text,
+                serial,
+                len(frame),
+                device_time,
+            )
+            if self.server.unknown_log_file is not None:
+                append_unknown_frame(
+                    self.server.unknown_log_file,
+                    peer,
+                    frame_number,
+                    message_type,
+                    frame,
+                )
+
+        if self.server.verbose_registers:
+            log_register_snapshot(frame_number, message_type, frame)
+
 
 class SolintegServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
@@ -264,8 +452,12 @@ class SolintegServer(socketserver.ThreadingTCPServer):
         self,
         server_address: tuple[str, int],
         strict_known_types: bool,
+        verbose_registers: bool,
+        unknown_log_file: Optional[Path],
     ) -> None:
         self.strict_known_types = strict_known_types
+        self.verbose_registers = verbose_registers
+        self.unknown_log_file = unknown_log_file
         super().__init__(server_address, SolintegRequestHandler)
 
     def server_bind(self) -> None:
@@ -278,6 +470,16 @@ def run_self_test() -> None:
         raise AssertionError("CRC-16/Modbus test vector failed")
     if KNOWN_MESSAGE_TYPES != frozenset(MESSAGE_TYPE_DESCRIPTIONS):
         raise AssertionError("known message types and descriptions differ")
+
+    decoded_soc = list(decode_register_range(33000, [7654]))
+    if len(decoded_soc) != 1 or decoded_soc[0].value != "76.54 %":
+        raise AssertionError("Modbus register scaling test failed")
+    decoded_signed = list(decode_register_range(53522, [0xFFF6]))
+    if len(decoded_signed) != 1 or decoded_signed[0].value != "-1.0 A":
+        raise AssertionError("signed Modbus register test failed")
+    decoded_unknown = list(decode_register_range(12345, [0xABCD]))
+    if len(decoded_unknown) != 1 or decoded_unknown[0].name != "Raw Field":
+        raise AssertionError("unknown Modbus register test failed")
 
     serial = b"TESTSIM000000001"  # Exactly 16 bytes.
     timestamp = bytes((26, 8, 23, 22, 20, 56))
@@ -337,7 +539,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable debug logging",
+        help="Decode and log every transmitted register using the Broker v5.12 table",
+    )
+    parser.add_argument(
+        "--log-unknown",
+        nargs="?",
+        const=DEFAULT_UNKNOWN_LOG_FILE,
+        type=Path,
+        metavar="PATH",
+        help=(
+            "save valid frames of previously unseen types as JSON Lines; "
+            f"default PATH: {DEFAULT_UNKNOWN_LOG_FILE}"
+        ),
     )
     parser.add_argument(
         "--self-test",
@@ -356,12 +569,14 @@ def main() -> int:
         run_self_test()
         return 0
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        server = SolintegServer((args.bind, args.port), args.strict_known_types)
+        server = SolintegServer(
+            (args.bind, args.port),
+            args.strict_known_types,
+            args.verbose,
+            args.log_unknown,
+        )
     except OSError as error:
         logging.error("cannot listen on %s:%d: %s", args.bind, args.port, error)
         return 1
@@ -379,10 +594,12 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
 
     logging.info(
-        "Solinteg simulator listening on %s:%d; strict=%s",
+        "Solinteg simulator listening on %s:%d; strict=%s verbose=%s log_unknown=%s",
         args.bind,
         args.port,
         args.strict_known_types,
+        args.verbose,
+        args.log_unknown if args.log_unknown is not None else "off",
     )
     try:
         server.serve_forever(poll_interval=0.5)
