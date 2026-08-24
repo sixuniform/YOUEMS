@@ -23,7 +23,7 @@ import struct
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Final, NamedTuple, Optional
 
@@ -252,6 +252,39 @@ def build_cloud_write_ack(command: bytes, device_timestamp: bytes) -> bytes:
     return body + struct.pack("<H", _crc16_modbus(body))
 
 
+def advance_device_timestamp(timestamp: bytes, elapsed_seconds: float) -> bytes:
+    """Advance a six-byte Solinteg timestamp by elapsed monotonic time."""
+
+    if len(timestamp) != 6:
+        raise ValueError("device timestamp must contain six bytes")
+    try:
+        observed = datetime(
+            2000 + timestamp[0],
+            timestamp[1],
+            timestamp[2],
+            timestamp[3],
+            timestamp[4],
+            timestamp[5],
+        )
+    except ValueError as error:
+        raise ValueError("device timestamp contains an invalid date or time") from error
+
+    # Never invent time before the observation, and do not round into the
+    # future. Genuine command replies advance the module clock continuously
+    # rather than repeating the timestamp of the preceding telemetry frame.
+    advanced = observed + timedelta(seconds=max(0, int(elapsed_seconds)))
+    return bytes(
+        (
+            advanced.year % 100,
+            advanced.month,
+            advanced.day,
+            advanced.hour,
+            advanced.minute,
+            advanced.second,
+        )
+    )
+
+
 class CloudForwarder:
     """Mirror acknowledged inverter frames through SOCKS5 in isolation."""
 
@@ -280,6 +313,7 @@ class CloudForwarder:
             maxlen=GENERATED_REPLY_QUEUE_SIZE
         )
         self._latest_device_timestamp: Optional[bytes] = None
+        self._latest_device_timestamp_observed_at: Optional[float] = None
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -300,6 +334,7 @@ class CloudForwarder:
 
         if len(frame) >= 32 and frame[6:8] in CLOUD_TELEMETRY_ACK_TYPES:
             self._latest_device_timestamp = frame[26:32]
+            self._latest_device_timestamp_observed_at = time.monotonic()
 
         try:
             self._queue.put_nowait(frame)
@@ -437,6 +472,20 @@ class CloudForwarder:
                 return "ignored_router_error"
         if self.fake_ack_cloud_writes and message_type == CLOUD_WRITE_TYPE:
             timestamp = self._latest_device_timestamp
+            observed_at = self._latest_device_timestamp_observed_at
+            if timestamp is not None and observed_at is not None:
+                try:
+                    timestamp = advance_device_timestamp(
+                        timestamp,
+                        time.monotonic() - observed_at,
+                    )
+                except ValueError as error:
+                    logging.warning(
+                        "could not advance cached inverter timestamp: %s; "
+                        "using local clock",
+                        error,
+                    )
+                    timestamp = None
             if timestamp is None:
                 local_now = datetime.now().astimezone()
                 timestamp = bytes(
@@ -597,14 +646,21 @@ class CloudForwarder:
                     if pending_offset == len(pending_frame):
                         if pending_generated_reply:
                             logging.warning(
-                                "fake cloud-write ACK sent: type=%s length=%d "
-                                "sha256=%s",
+                                "fake cloud-write ACK sent to socket: type=%s "
+                                "length=%d device_time=%s sha256=%s",
                                 pending_frame[6:8].hex(":")
                                 if len(pending_frame) >= 8
                                 else "unknown",
                                 len(pending_frame),
+                                "20%02d-%02d-%02d %02d:%02d:%02d"
+                                % tuple(pending_frame[24:30]),
                                 hashlib.sha256(pending_frame).hexdigest(),
                             )
+                            if self.verbose_registers:
+                                logging.info(
+                                    "fake cloud-write ACK frame_base64=%s",
+                                    base64.b64encode(pending_frame).decode("ascii"),
+                                )
                         else:
                             logging.info(
                                 "cloud mirror forwarded frame: type=%s length=%d",

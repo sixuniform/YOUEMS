@@ -41,6 +41,7 @@ from typing import Final, NamedTuple, Optional
 from solinteg_modbus_map import decode_register_range
 from solinteg_cloud_forwarder import (
     CloudForwarder,
+    advance_device_timestamp,
     build_cloud_write_ack,
     parse_cloud_write,
     parse_endpoint,
@@ -664,6 +665,12 @@ def run_self_test() -> None:
         fake_cloud_ack[-2:], "little"
     ):
         raise AssertionError("fake cloud ACK CRC test failed")
+    advanced_timestamp = advance_device_timestamp(
+        bytes((26, 8, 23, 23, 59, 58)),
+        5.9,
+    )
+    if advanced_timestamp != bytes((26, 8, 24, 0, 0, 3)):
+        raise AssertionError("advancing device timestamp test failed")
     print("Self-test passed")
 
 

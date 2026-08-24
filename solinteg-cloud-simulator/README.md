@@ -216,8 +216,9 @@ For the observed 58-byte `01:10` commands, the reply has this exact layout:
 This transformation reproduced both captured genuine inverter replies exactly.
 The command timestamp itself is not echoed: the inverter used its current
 timestamp. The simulator therefore caches the timestamp from the latest
-outgoing telemetry frame and uses the local clock only before such a timestamp
-has been observed.
+outgoing telemetry frame, advances it using monotonic elapsed time, and uses
+the local clock only before a valid device timestamp has been observed. Reusing
+the cached timestamp unchanged did not complete the first cloud-UI test.
 
 ### Relationship to the Modbus delays
 
@@ -515,7 +516,11 @@ exclusive. The cloud UI may report that a blocked setting change succeeded
 even though the inverter was deliberately left unchanged. Use this mode only
 when that distinction is understood. The cloud-input JSONL action is
 `fake_ack_queued`; successful transmission of the generated response is also
-recorded in the console or journal with its SHA-256.
+recorded in the console or journal with its device timestamp and SHA-256. With
+`--verbose`, the complete generated response is additionally logged as base64
+for protocol diagnosis. “Sent to socket” means that the complete frame was
+accepted by the local TCP stack; the cloud may still require subsequent
+telemetry to confirm that the requested setting actually changed.
 
 ## Enabling options under systemd
 
