@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Rickard Dahlstedt
-"""Solinteg register translations used by the cloud-frame simulator.
+"""Canonical shared Solinteg register metadata and translations.
 
-The table and decoding rules are derived from Modbus Broker v5.12, whose
-metadata combines the current Solinteg Home Assistant plugin with Solinteg
-protocol v00.02.  This module has no third-party runtime dependencies.
+The original table was synchronized from Modbus Broker v5.12. Its metadata
+combines the current Solinteg Home Assistant plugin, Solinteg protocol v00.02,
+and controlled empirical observations. The cloud-frame simulator and Modbus
+Broker are intended to import this same module. It has no third-party runtime
+dependencies.
 """
 
 from __future__ import annotations
@@ -122,6 +124,25 @@ FLAGS_TOU_PERIODS = [
     'Period 5 enabled',
     'Period 6 enabled',
 ]
+
+TOU_SCHEDULE_DAYS = {
+    1: 'Today',
+    2: 'Tomorrow',
+}
+
+# Intelligent/ToU slot actions carried by staging register 53076. Values
+# 0x0401, 0x0402, 0x0403, 0x0405, and 0x0406 were captured directly. The
+# historical app exposed Peak Shifting in the missing 0x0404 position, but no
+# command using that value has yet been captured; keep that distinction in the
+# public label instead of presenting it as confirmed.
+TOU_SLOT_MODES = {
+    0x0401: 'General',
+    0x0402: 'Battery Charge',
+    0x0403: 'PV Charging',
+    0x0404: 'Peak Shifting (inferred legacy; not captured)',
+    0x0405: 'Feed-In',
+    0x0406: 'Battery Discharge',
+}
 
 BMS_ERROR_FLAGS = [
     'Internal COM Fault',
@@ -329,6 +350,23 @@ REGISTER_METADATA = {
     # Confirmed by a direct read from a Solinteg inverter on 2026-08-24.
     20016: {'name': 'Normal Cloud Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': ''},
     20046: {'name': 'Technical Service Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': ''},
+    # Controlled cloud-UI observations showed 0 for Never/Off and 1 for every
+    # enabled cadence (Once, Daily, 7, 15, or 30 days). The cadence itself is
+    # therefore not encoded in this register.
+    21001: {
+        'name': 'Battery SOC Reset Enable',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': {
+            0: 'Off / Never',
+            1: 'Enabled (cadence stored elsewhere)',
+        },
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed_boolean_only',
+    },
     25000: {'name': 'Safety Code Setting', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': SAFETY_CODES},
     25008: {'name': 'Inverter Command', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {257: 'Start', 256: 'Stop Soft', 1028: 'Stop Full'}},
     25009: {'name': 'Inverter Restart', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {1: 'Restart'}},
@@ -496,6 +534,185 @@ REGISTER_METADATA = {
     53046: {'name': 'TOU Period 6 Reserved 2', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {255: 'Reserved marker'}},
     53047: {'name': 'TOU Period 6 Start Time', 'type': 'HHMM', 'words': 1, 'scale': 1, 'unit': ''},
     53048: {'name': 'TOU Period 6 Stop Time', 'type': 'HHMM', 'words': 1, 'scale': 1, 'unit': ''},
+    # Intelligent/ToU schedule staging interface, reconstructed from a complete
+    # controlled cloud upload and genuine inverter replies. The upload wrote
+    # all 24 slots for Today, committed them with 53070=1, then repeated the
+    # process for Tomorrow. A complete transaction contained 51 successful
+    # writes including 50000=0x0400. Registers 53071..53084 are a staging
+    # record, not a directly indexed readable schedule table.
+    53070: {
+        'name': 'Intelligent TOU Commit Strobe',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': {
+            1: 'Commit staged schedule day',
+            0xFFFF: 'Idle / readback sentinel',
+        },
+        'access': 'RW',
+        'write_semantics': 'command_strobe',
+        'write_values': (1,),
+        'observed_readback': 0xFFFF,
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53071: {
+        'name': 'Intelligent TOU Schedule Day',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': TOU_SCHEDULE_DAYS,
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53072: {
+        'name': 'Intelligent TOU Slot Index',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'minimum': 0,
+        'maximum': 23,
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53073: {
+        'name': 'Intelligent TOU Slot Enable',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': {0: 'Disabled', 1: 'Enabled'},
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53074: {
+        'name': 'Intelligent TOU Slot Start Time',
+        'type': 'HHMM',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'encoding': '(hour << 8) | minute',
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53075: {
+        'name': 'Intelligent TOU Slot Stop Time',
+        'type': 'HHMM',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'encoding': '(hour << 8) | minute',
+        'special_values': {0x1800: '24:00'},
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53076: {
+        'name': 'Intelligent TOU Slot Mode',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': TOU_SLOT_MODES,
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed_except_0x0404',
+    },
+    53077: {
+        'name': 'Intelligent TOU Mode Option / Source / Priority',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': {0: 'PV priority (observed; mode-dependent)'},
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'partial_only_zero_captured',
+    },
+    53078: {
+        'name': 'Intelligent TOU Maximum AC Power',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': 'W',
+        'app_label': 'Power to grid / Maximum AC power',
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed',
+    },
+    53079: {
+        'name': 'Intelligent TOU Charge / Discharge Power Limit',
+        'type': 'U16',
+        'words': 1,
+        'scale': 0.1,
+        'unit': 'kW',
+        'semantics': 'Mode-dependent; charge or discharge limit',
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed_for_charge_and_discharge_modes',
+    },
+    53080: {
+        'name': 'Intelligent TOU Target / Minimum SOC',
+        'type': 'U16',
+        'words': 1,
+        'scale': 0.1,
+        'unit': '%',
+        'semantics': 'Mode-dependent; charge target or discharge floor',
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'confirmed_for_charge_and_discharge_modes',
+    },
+    53081: {
+        'name': 'Intelligent TOU Reserved 1',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'observed_values': (0,),
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'unknown_reserved_zero',
+    },
+    53082: {
+        'name': 'Intelligent TOU Reserved 2',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'observed_values': (0,),
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'unknown_reserved_zero',
+    },
+    53083: {
+        'name': 'Intelligent TOU Reserved 3',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'observed_values': (0,),
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'unknown_reserved_zero',
+    },
+    53084: {
+        'name': 'Intelligent TOU Reserved 4',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'observed_values': (0,),
+        'access': 'RW',
+        'source': 'empirical_cloud_write',
+        'confidence': 'unknown_reserved_zero',
+    },
     53500: {'name': 'EMS BMS Version', 'type': 'STR', 'words': 8, 'scale': 1, 'unit': ''},
     53508: {'name': 'EMS BMS Status', 'type': 'BMS_STATUS', 'words': 1, 'scale': 1, 'unit': ''},
     53509: {'name': 'EMS BMS Error Code', 'type': 'U32', 'words': 2, 'scale': 1, 'unit': '', 'flags': BMS_ERROR_FLAGS},
