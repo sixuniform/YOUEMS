@@ -193,12 +193,24 @@ inverter:
 | `50000` | Working-mode selection |
 | `50007` | Import-limit switch |
 | `50009` | Import-limit value, scaled by 0.1 kW |
+| `50016` | Peak Shaving Max Grid Import Power, scaled by 0.1 kW |
+| `50017` | Peak Shaving Minimum SOC, scaled by 0.1% |
+| `50018` | Peak Shaving Battery Max Grid Charge, scaled by 0.1 kW |
+| `50022` | Peak Shaving switch: `0` off, `1` on |
 
 The captured clock command encoded the exact local date and time in three
 packed registers. Controlled working-mode, restart, and import-limit changes
 then matched the existing Broker v5.12 register names, enum values, and scale
 exactly. An identical mode command was observed more than once, consistent
 with the cloud retrying when its command received no inverter acknowledgement.
+
+Registers `50016`, `50017`, `50018`, and `50022` were discovered later by
+correlating controlled Peak Shaving changes in the cloud UI with decoded
+`01:10` writes. They are absent from Solinteg register table v00.03 and the
+current upstream Solinteg Home Assistant plugin. The simulator therefore marks
+them as empirically discovered `RW` candidates: cloud writability is proven,
+while direct writes through the inverter's public Modbus interface should be
+verified cautiously on each firmware version.
 
 The controlled writes also captured their genuine inverter acknowledgements.
 For the observed 58-byte `01:10` commands, the reply has this exact layout:
@@ -277,7 +289,7 @@ SIMULATOR_ADDRESS=192.168.10.50
 INVERTER_ADDRESS=192.168.10.99
 CLOUD_ADDRESS=8.211.16.247
 LISTEN_PORT=5743
-# Example: SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080"
+# Example: SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083"
 SIMULATOR_OPTIONS=
 ```
 
@@ -405,7 +417,7 @@ Enable the mirror by giving the proxy endpoint. The real cloud target defaults
 to `iot.solinteg-cloud.com:5743`:
 
 ```ini
-SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080"
+SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083"
 ```
 
 The default implementation is intentionally not a transparent bidirectional
@@ -433,7 +445,7 @@ interception host—resolves `iot.solinteg-cloud.com`. To use a different cloud
 endpoint explicitly:
 
 ```ini
-SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1080 --forward-target example.invalid:5743"
+SIMULATOR_OPTIONS="--forward-socks5 192.168.0.1:1083 --forward-target example.invalid:5743"
 ```
 
 For a proxy using username/password authentication, set these separately in
@@ -485,7 +497,7 @@ To learn the inverter's genuine response to cloud writes, temporarily enable:
 ```bash
 python3 solinteg-cloud-simulator.py \
   --bind 192.168.10.50 --port 5743 \
-  --forward-socks5 192.168.0.1:1080 \
+  --forward-socks5 192.168.0.1:1083 \
   --allow-cloud-commands --verbose --log-unknown
 ```
 
@@ -514,7 +526,7 @@ finish successfully, enable:
 ```bash
 python3 solinteg-cloud-simulator.py \
   --bind 192.168.10.50 --port 5743 \
-  --forward-socks5 192.168.0.1:1080 \
+  --forward-socks5 192.168.0.1:1083 \
   --fake-ack-cloud-commands --verbose
 ```
 
@@ -528,11 +540,18 @@ confirmation sequence:
 2. genuine-format 58-byte `01:10` success response;
 3. a second patched cloud-only `01:03` approximately two seconds later.
 
-When the cloud acknowledges both generated `01:03` frames, the temporary
-register shadow is immediately discarded. Later genuine frames therefore
-return to the inverter's real values; the simulator does not maintain a
-persistent fictional state. If the commanded register is absent from the
-cached configuration snapshot, only the `01:10` response is generated.
+The temporary register shadow accumulates all writes received during a
+60-second window measured from the most recent command. Cloud acknowledgements
+for an earlier command do not clear later or still-active values. Every genuine
+`01:03` sent to the cloud during that window is patched with the complete
+accumulated set, which lets several app settings made in quick succession share
+one coherent confirmation state. After the window expires, the shadow and any
+stale confirmation trackers are discarded and genuine frames return to the
+inverter's real values. Change the window with
+`--cloud-shadow-retention SECONDS` (range 1–3600). If a commanded register is
+absent from the cached configuration snapshot, the fake `01:10` response is
+still generated and the value remains eligible for a later `01:03` until the
+window expires.
 
 Normal telemetry acknowledgements from the cloud remain suppressed because
 the simulator has already acknowledged those frames locally. Unknown cloud
@@ -544,8 +563,8 @@ even though the inverter was deliberately left unchanged. Use this mode only
 when that distinction is understood. The cloud-input JSONL action is
 `fake_ack_and_shadow_queued` when matching configuration registers were found.
 The cloud acknowledgements are recorded as
-`shadow_confirmation_acknowledged`; after the final one, the console records
-that the temporary register shadow was discarded. Successful transmission of
+`shadow_confirmation_acknowledged`; after the final outstanding acknowledgement,
+the console records how long the accumulated shadow remains active. Successful transmission of
 each generated frame is logged with its device timestamp and SHA-256. With
 `--verbose`, complete generated frames are additionally logged as base64 for
 protocol diagnosis. “Sent to socket” means that the complete frame was
@@ -559,7 +578,7 @@ the service. Diagnostic and forwarding options may be used independently or
 together:
 
 ```ini
-SIMULATOR_OPTIONS="--verbose --log-unknown --forward-socks5 192.168.0.1:1080"
+SIMULATOR_OPTIONS="--verbose --log-unknown --forward-socks5 192.168.0.1:1083"
 ```
 
 ```bash

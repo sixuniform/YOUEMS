@@ -38,6 +38,7 @@ SELECT_TIMEOUT_SECONDS: Final = 0.25
 MAX_RECONNECT_DELAY_SECONDS: Final = 30.0
 GENERATED_REPLY_QUEUE_SIZE: Final = 64
 SHADOW_CONFIRMATION_DELAY_SECONDS: Final = 2.0
+DEFAULT_SHADOW_RETENTION_SECONDS: Final = 60.0
 CLOUD_TELEMETRY_ACK_TYPES: Final = frozenset(
     (b"\x01\x03", b"\x01\x04", b"\x01\x44")
 )
@@ -356,6 +357,7 @@ class CloudForwarder:
         verbose_registers: bool = False,
         incoming_handler: Optional[Callable[[bytes], str]] = None,
         fake_ack_cloud_writes: bool = False,
+        shadow_retention_seconds: float = DEFAULT_SHADOW_RETENTION_SECONDS,
     ) -> None:
         self.proxy = proxy
         self.target = target
@@ -365,6 +367,7 @@ class CloudForwarder:
         self.verbose_registers = verbose_registers
         self.incoming_handler = incoming_handler
         self.fake_ack_cloud_writes = fake_ack_cloud_writes
+        self.shadow_retention_seconds = shadow_retention_seconds
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_size)
         self._generated_replies: deque[GeneratedCloudFrame] = deque(
             maxlen=GENERATED_REPLY_QUEUE_SIZE
@@ -377,6 +380,7 @@ class CloudForwarder:
         self._latest_device_timestamp_observed_at: Optional[float] = None
         self._latest_configuration_frame: Optional[bytes] = None
         self._shadow_registers: dict[int, int] = {}
+        self._shadow_expires_at: Optional[float] = None
         self._pending_shadow_confirmations: dict[tuple[bytes, bytes], int] = {}
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -396,6 +400,7 @@ class CloudForwarder:
     def enqueue(self, frame: bytes) -> None:
         """Queue one copy without waiting for SOCKS, DNS, cloud, or disk I/O."""
 
+        self._expire_shadow_if_due()
         message_type = frame[6:8] if len(frame) >= 8 else b""
         if len(frame) >= 32 and message_type in CLOUD_TELEMETRY_ACK_TYPES:
             with self._state_lock:
@@ -599,6 +604,29 @@ class CloudForwarder:
                 self._pending_shadow_confirmations.get(key, 0) + 1
             )
 
+    def _expire_shadow_if_due(self, now: Optional[float] = None) -> bool:
+        """Discard an accumulated cloud-only register shadow after its grace period."""
+
+        if now is None:
+            now = time.monotonic()
+        with self._state_lock:
+            expires_at = self._shadow_expires_at
+            if expires_at is None or now < expires_at:
+                return False
+            register_count = len(self._shadow_registers)
+            pending_count = sum(self._pending_shadow_confirmations.values())
+            self._shadow_registers.clear()
+            self._shadow_expires_at = None
+            self._pending_shadow_confirmations.clear()
+        logging.warning(
+            "cloud command shadow expired after %.1f seconds: registers=%d "
+            "unacknowledged_confirmations=%d; genuine values will be sent again",
+            self.shadow_retention_seconds,
+            register_count,
+            pending_count,
+        )
+        return True
+
     def _consume_shadow_confirmation_ack(self, frame: bytes) -> bool:
         if len(frame) < 30:
             return False
@@ -614,8 +642,13 @@ class CloudForwarder:
             else:
                 self._pending_shadow_confirmations[key] = count - 1
             remaining = sum(self._pending_shadow_confirmations.values())
-            if remaining == 0:
-                self._shadow_registers.clear()
+            shadow_count = len(self._shadow_registers)
+            expires_at = self._shadow_expires_at
+            retain_for = (
+                max(0.0, expires_at - time.monotonic())
+                if expires_at is not None
+                else 0.0
+            )
 
         logging.warning(
             "cloud acknowledged shadow confirmation: type=%s device_time=%s "
@@ -627,7 +660,9 @@ class CloudForwarder:
         if remaining == 0:
             logging.warning(
                 "cloud command confirmation complete; temporary register "
-                "shadow discarded"
+                "shadow retained for up to %.1f more seconds: registers=%d",
+                retain_for,
+                shadow_count,
             )
         return True
 
@@ -662,6 +697,13 @@ class CloudForwarder:
                         range(command.start, command.end + 1),
                         command.values,
                     )
+                )
+                # Closely spaced app changes form one accumulating transaction
+                # window. Every later 01:03 sent during the window contains all
+                # staged values, even if acknowledgements for earlier commands
+                # arrive in between.
+                self._shadow_expires_at = (
+                    time.monotonic() + self.shadow_retention_seconds
                 )
                 shadow_registers = dict(self._shadow_registers)
                 configuration_frame = self._latest_configuration_frame
@@ -716,9 +758,12 @@ class CloudForwarder:
             # seconds later.
             self._queue_generated(acknowledgement, "write_ack")
             if confirmation_count == 0:
-                with self._state_lock:
-                    for address in range(command.start, command.end + 1):
-                        self._shadow_registers.pop(address, None)
+                logging.warning(
+                    "cloud write has no immediate 01:03 confirmation; its "
+                    "register shadow remains eligible for later configuration "
+                    "snapshots for %.1f seconds",
+                    self.shadow_retention_seconds,
+                )
             return (
                 "fake_ack_and_shadow_queued"
                 if confirmation_count
@@ -785,6 +830,7 @@ class CloudForwarder:
 
         while not self._stop_event.is_set():
             now = time.monotonic()
+            self._expire_shadow_if_due(now)
             while (
                 self._scheduled_replies
                 and self._scheduled_replies[0][0] <= now
@@ -948,6 +994,7 @@ class CloudForwarder:
                 self._scheduled_replies.clear()
                 with self._state_lock:
                     self._shadow_registers.clear()
+                    self._shadow_expires_at = None
                     self._pending_shadow_confirmations.clear()
                 next_connect_at = time.monotonic() + reconnect_delay
                 reconnect_delay = (

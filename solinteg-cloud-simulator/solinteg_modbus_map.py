@@ -422,6 +422,14 @@ REGISTER_METADATA = {
     50009: {'name': 'Import Limit', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': 'kW'},
     50010: {'name': 'Parallel Master-Slave Sign', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Independent Operating', 1: 'Parallel (Slave)', 2: 'Parallel (Master)'}},
     50012: {'name': 'Battery Protection Relax', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Off', 1: 'On'}},
+    # Empirically discovered in controlled 2026-08-24 cloud-UI writes. These
+    # registers are newer than Solinteg table v00.03 and the current upstream
+    # Home Assistant Solinteg plugin. The cloud writes them as U16 words and
+    # confirms them in the 01:03 configuration snapshot.
+    50016: {'name': 'Peak Shaving Max Grid Import Power', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': 'kW', 'access': 'RW', 'source': 'empirical_cloud_write'},
+    50017: {'name': 'Peak Shaving Minimum SOC', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': '%', 'access': 'RW', 'source': 'empirical_cloud_write'},
+    50018: {'name': 'Peak Shaving Battery Max Grid Charge', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': 'kW', 'access': 'RW', 'source': 'empirical_cloud_write'},
+    50022: {'name': 'Peak Shaving Switch', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Off', 1: 'On'}, 'access': 'RW', 'source': 'empirical_cloud_write'},
     50200: {'name': 'Grid Mode Toggle', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'On-Grid', 1: 'Off-Grid'}},
     50201: {'name': 'Clear Off-grid Overload Protection', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {1: 'Clear protection flag'}},
     50202: {'name': 'EMS AC Ctrl Scheduling Mode', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Off', 1: 'Total Power', 2: 'Phase Level Power'}},

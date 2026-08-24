@@ -41,6 +41,7 @@ from typing import Final, NamedTuple, Optional
 from solinteg_modbus_map import decode_register_range
 from solinteg_cloud_forwarder import (
     CloudForwarder,
+    DEFAULT_SHADOW_RETENTION_SECONDS,
     advance_device_timestamp,
     build_cloud_write_ack,
     patch_register_snapshot,
@@ -654,6 +655,18 @@ def run_self_test() -> None:
     decoded_limit = list(decode_register_range(cloud_write.start, cloud_write.values))
     if len(decoded_limit) != 1 or decoded_limit[0].value != "13.7 kW":
         raise AssertionError("cloud write register-value test failed")
+    peak_shaving_cases = (
+        (50016, 100, "10.0 kW"),
+        (50017, 800, "80.0 %"),
+        (50018, 50, "5.0 kW"),
+        (50022, 1, "1 (On)"),
+    )
+    for address, raw_value, expected_value in peak_shaving_cases:
+        decoded = list(decode_register_range(address, [raw_value]))
+        if len(decoded) != 1 or decoded[0].value != expected_value:
+            raise AssertionError(
+                f"peak-shaving register {address} translation test failed"
+            )
     fake_ack_timestamp = bytes((26, 8, 23, 22, 21, 57))
     fake_cloud_ack = build_cloud_write_ack(cloud_write_frame, fake_ack_timestamp)
     if fake_cloud_ack[24:30] != fake_ack_timestamp:
@@ -786,6 +799,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cloud-shadow-retention",
+        type=float,
+        default=DEFAULT_SHADOW_RETENTION_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "retain and accumulate fake cloud-write values in outgoing 01:03 "
+            "snapshots after the most recent write "
+            f"(default: {DEFAULT_SHADOW_RETENTION_SECONDS:g})"
+        ),
+    )
+    parser.add_argument(
         "--forward-target",
         default=DEFAULT_CLOUD_TARGET,
         metavar="HOST:PORT",
@@ -826,6 +850,8 @@ def parse_args() -> argparse.Namespace:
             "--fake-ack-cloud-commands cannot be combined with "
             "--allow-cloud-commands"
         )
+    if not 1.0 <= args.cloud_shadow_retention <= 3600.0:
+        parser.error("--cloud-shadow-retention must be between 1 and 3600 seconds")
     if args.allow_cloud_commands and args.strict_known_types:
         parser.error(
             "--allow-cloud-commands cannot be combined with --strict-known-types"
@@ -871,6 +897,7 @@ def main() -> int:
                 else None
             ),
             fake_ack_cloud_writes=args.fake_ack_cloud_commands,
+            shadow_retention_seconds=args.cloud_shadow_retention,
         )
 
     try:
@@ -912,10 +939,12 @@ def main() -> int:
             logging.warning(
                 "FAKE CLOUD COMMAND ACKNOWLEDGEMENTS ENABLED: proxy=%s target=%s "
                 "incoming=%s; 01:10 writes are blocked but reported with "
-                "temporary cloud-only configuration confirmation",
+                "temporary cloud-only configuration confirmation; shadow "
+                "retention=%.1fs",
                 args.forward_socks5,
                 args.forward_target,
                 args.cloud_incoming_log,
+                args.cloud_shadow_retention,
             )
         else:
             logging.info(
