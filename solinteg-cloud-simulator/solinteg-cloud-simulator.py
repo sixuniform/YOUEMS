@@ -648,6 +648,18 @@ def run_self_test() -> None:
     decoded_unknown = list(decode_register_range(12345, [0xABCD]))
     if len(decoded_unknown) != 1 or decoded_unknown[0].name != "Raw Field":
         raise AssertionError("unknown Modbus register test failed")
+    endpoint_text = b"5743,iot.solinteg-cloud.com".ljust(60, b"\x00")
+    endpoint_words = tuple(
+        int.from_bytes(endpoint_text[offset:offset + 2], "big")
+        for offset in range(0, len(endpoint_text), 2)
+    )
+    decoded_endpoint = list(decode_register_range(20016, endpoint_words))
+    if (
+        len(decoded_endpoint) != 1
+        or decoded_endpoint[0].name != "Normal Cloud Endpoint"
+        or decoded_endpoint[0].value != "5743,iot.solinteg-cloud.com"
+    ):
+        raise AssertionError("confirmed cloud-endpoint register test failed")
 
     serial = b"TESTSIM000000001"  # Exactly 16 bytes.
     timestamp = bytes((26, 8, 23, 22, 20, 56))

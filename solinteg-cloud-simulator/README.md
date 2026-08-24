@@ -152,6 +152,58 @@ scaling, units, strings, versions, packed date/time fields, enums, alarm/status
 bits, and the BMS status word. The optional verbose logger applies those same
 translations directly to every register range carried by the cloud frame.
 
+### Read-only probe for tentative service/network registers
+
+A third-party M-TEC Energy Butler investigation reported several otherwise
+undocumented fields in the same register family used by Solinteg. These are
+controlled observations from another branded inverter, not official Solinteg
+definitions. The original discussion is
+[Photovoltaikforum page 63](https://www.photovoltaikforum.com/thread/206243-erfahrungen-mit-m-tec-energy-butler-hybrid-wechselrichter/?pageNo=63).
+
+Several findings on that page are already represented in the Broker v5.12
+table: both RTC blocks, battery current limits `33021`/`33023`, and the EMS BMS
+block `53500–53523`. Direct reads from a Solinteg have since confirmed both
+endpoint strings; the other fields remain candidates:
+
+| Register(s) | Meaning under test | Status |
+|---:|---|---|
+| `20007–20008` | Duplicate total generation energy, possibly matching `11020–11021` | Tentative |
+| `20010` | Work-hours counter | Tentative |
+| `20011` | Unknown serial-format/communication setting | Speculative |
+| `20012` | Modbus device ID | Tentative |
+| `20016–20045` | Normal cloud endpoint ASCII field | Confirmed on Solinteg |
+| `20046–20075` | Technical endpoint ASCII field | Confirmed on Solinteg |
+| `20076–20087` | Opaque service values | Unknown |
+| `20088–20099` | Three credential-like ASCII fields | Tentative |
+| `20100–20139` | Unknown network/service block; all zero on one reported firmware | Unknown |
+| `20140` | Network-mode candidate | Tentative |
+| `20141–20142` | Static/non-DHCP IPv4 address candidate | Tentative |
+| `20143–20144` | Gateway candidate | Tentative |
+| `20145–20146` | Network-mask candidate | Tentative |
+| `20147–20148` | DNS-server candidate | Tentative |
+| `20149–20150` | DHCP-provided IPv4 address candidate | Tentative |
+
+`probe-undocumented-registers.py` reads those blocks and known RTC,
+generation-energy, and generation-hours references for comparison. It uses
+only `read_holding_registers`; there are no Modbus write calls in the program.
+Multiword fields remain in one request because some Solinteg firmware rejects
+partial reads of packed values.
+
+Run it against the local Modbus Broker:
+
+```bash
+python3 probe-undocumented-registers.py \
+  --host 127.0.0.1 --port 502 --slave 255 \
+  2>&1 | tee /tmp/solinteg-undocumented-registers.log
+```
+
+The raw word dump is followed by tentative interpretations and comparisons.
+The three credential-like fields are represented only by length and a short
+SHA-256 prefix unless `--show-sensitive` is deliberately supplied. Do not use
+that option in logs intended for sharing. The probe should be run once under
+normal operating conditions; it is not intended as an additional continuous
+poller.
+
 ### Known request types
 
 | Type | Observed size | Register records | Register values | Observed purpose |

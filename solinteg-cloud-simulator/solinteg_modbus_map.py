@@ -326,6 +326,9 @@ REGISTER_METADATA = {
     20000: {'name': 'Inverter RTC Year/Month Setting', 'type': 'PACKED_YM', 'words': 1, 'scale': 1, 'unit': ''},
     20001: {'name': 'Inverter RTC Day/Hour Setting', 'type': 'PACKED_DH', 'words': 1, 'scale': 1, 'unit': ''},
     20002: {'name': 'Inverter RTC Minute/Second Setting', 'type': 'PACKED_MS', 'words': 1, 'scale': 1, 'unit': ''},
+    # Confirmed by a direct read from a Solinteg inverter on 2026-08-24.
+    20016: {'name': 'Normal Cloud Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': ''},
+    20046: {'name': 'Technical Service Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': ''},
     25000: {'name': 'Safety Code Setting', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': SAFETY_CODES},
     25008: {'name': 'Inverter Command', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {257: 'Start', 256: 'Stop Soft', 1028: 'Stop Full'}},
     25009: {'name': 'Inverter Restart', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {1: 'Restart'}},

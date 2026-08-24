@@ -18,6 +18,9 @@ install -d -m 0755 "$install_directory"
 install -m 0755 \
     "$source_directory/solinteg-cloud-simulator.py" \
     "$install_directory/solinteg-cloud-simulator.py"
+install -m 0755 \
+    "$source_directory/probe-undocumented-registers.py" \
+    "$install_directory/probe-undocumented-registers.py"
 install -m 0644 \
     "$source_directory/solinteg_modbus_map.py" \
     "$install_directory/solinteg_modbus_map.py"
