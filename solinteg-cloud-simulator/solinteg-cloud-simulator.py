@@ -43,6 +43,7 @@ from solinteg_cloud_forwarder import (
     CloudForwarder,
     advance_device_timestamp,
     build_cloud_write_ack,
+    patch_register_snapshot,
     parse_cloud_write,
     parse_endpoint,
 )
@@ -671,6 +672,44 @@ def run_self_test() -> None:
     )
     if advanced_timestamp != bytes((26, 8, 24, 0, 0, 3)):
         raise AssertionError("advancing device timestamp test failed")
+
+    snapshot_body = b"".join(
+        (
+            MAGIC,
+            b"\x00\x00\x00\x00",
+            b"\x01\x03\x00\x00",
+            serial,
+            timestamp,
+            b"\x00" * 10,
+            timestamp,
+            b"\x01",
+            struct.pack(">HHH", 50007, 50007, 1),
+        )
+    )
+    snapshot_total = len(snapshot_body) + 2
+    snapshot_body = (
+        snapshot_body[:2]
+        + (snapshot_total - 9).to_bytes(4, "big")
+        + snapshot_body[6:]
+    )
+    snapshot = snapshot_body + struct.pack("<H", crc16_modbus(snapshot_body))
+    patched_snapshot, patched_addresses = patch_register_snapshot(
+        snapshot,
+        {50007: 0},
+        advanced_timestamp,
+    )
+    if patched_addresses != (50007,):
+        raise AssertionError("cloud shadow register-address test failed")
+    if patched_snapshot[26:32] != advanced_timestamp:
+        raise AssertionError("cloud shadow outer timestamp test failed")
+    if patched_snapshot[42:48] != advanced_timestamp:
+        raise AssertionError("cloud shadow snapshot timestamp test failed")
+    if patched_snapshot[53:55] != b"\x00\x00":
+        raise AssertionError("cloud shadow register-value test failed")
+    if crc16_modbus(patched_snapshot[:-2]) != int.from_bytes(
+        patched_snapshot[-2:], "little"
+    ):
+        raise AssertionError("cloud shadow CRC test failed")
     print("Self-test passed")
 
 
@@ -742,8 +781,8 @@ def parse_args() -> argparse.Namespace:
         "--fake-ack-cloud-commands",
         action="store_true",
         help=(
-            "block 01:10 cloud writes but return a synthetic success ACK based "
-            "on genuine inverter replies"
+            "block 01:10 cloud writes but reproduce the genuine ACK and "
+            "temporary 01:03 confirmation sequence"
         ),
     )
     parser.add_argument(
@@ -872,7 +911,8 @@ def main() -> int:
         elif args.fake_ack_cloud_commands:
             logging.warning(
                 "FAKE CLOUD COMMAND ACKNOWLEDGEMENTS ENABLED: proxy=%s target=%s "
-                "incoming=%s; 01:10 writes are blocked but reported successful",
+                "incoming=%s; 01:10 writes are blocked but reported with "
+                "temporary cloud-only configuration confirmation",
                 args.forward_socks5,
                 args.forward_target,
                 args.cloud_incoming_log,

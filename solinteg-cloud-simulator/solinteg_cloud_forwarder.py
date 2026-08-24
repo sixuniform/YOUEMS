@@ -37,6 +37,7 @@ CONNECT_TIMEOUT_SECONDS: Final = 10.0
 SELECT_TIMEOUT_SECONDS: Final = 0.25
 MAX_RECONNECT_DELAY_SECONDS: Final = 30.0
 GENERATED_REPLY_QUEUE_SIZE: Final = 64
+SHADOW_CONFIRMATION_DELAY_SECONDS: Final = 2.0
 CLOUD_TELEMETRY_ACK_TYPES: Final = frozenset(
     (b"\x01\x03", b"\x01\x04", b"\x01\x44")
 )
@@ -60,6 +61,13 @@ class CloudWrite(NamedTuple):
     end: int
     values: tuple[int, ...]
     padding: bytes
+
+
+class GeneratedCloudFrame(NamedTuple):
+    """One simulator-generated frame waiting for the cloud socket."""
+
+    frame: bytes
+    purpose: str
 
 
 def parse_cloud_write(frame: bytes) -> CloudWrite:
@@ -285,6 +293,55 @@ def advance_device_timestamp(timestamp: bytes, elapsed_seconds: float) -> bytes:
     )
 
 
+def patch_register_snapshot(
+    frame: bytes,
+    replacements: dict[int, int],
+    timestamp: Optional[bytes] = None,
+) -> tuple[bytes, tuple[int, ...]]:
+    """Patch selected register words in a cloud-bound telemetry snapshot."""
+
+    if len(frame) < 51 or frame[:2] != MAGIC:
+        raise ValueError("not a complete Solinteg register snapshot")
+    if int.from_bytes(frame[2:6], "big") + 9 != len(frame):
+        raise ValueError("register snapshot has an invalid declared length")
+    if _crc16_modbus(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+        raise ValueError("register snapshot has invalid CRC")
+    if timestamp is not None and len(timestamp) != 6:
+        raise ValueError("device timestamp must contain six bytes")
+
+    patched = bytearray(frame)
+    if timestamp is not None:
+        patched[26:32] = timestamp
+        patched[42:48] = timestamp
+
+    cursor = 49
+    data_end = len(frame) - 2
+    patched_addresses: list[int] = []
+    for _range_number in range(frame[48]):
+        if cursor + 4 > data_end:
+            raise ValueError("truncated register-range header")
+        start, end = struct.unpack_from(">HH", frame, cursor)
+        cursor += 4
+        if end < start:
+            raise ValueError(f"descending register range {start}..{end}")
+        word_count = end - start + 1
+        values_end = cursor + word_count * 2
+        if values_end > data_end:
+            raise ValueError(f"register range {start}..{end} is truncated")
+        for address in range(start, end + 1):
+            value = replacements.get(address)
+            if value is None:
+                continue
+            if not 0 <= value <= 0xFFFF:
+                raise ValueError(f"replacement for register {address} is not U16")
+            struct.pack_into(">H", patched, cursor + (address - start) * 2, value)
+            patched_addresses.append(address)
+        cursor = values_end
+
+    patched[-2:] = struct.pack("<H", _crc16_modbus(patched[:-2]))
+    return bytes(patched), tuple(patched_addresses)
+
+
 class CloudForwarder:
     """Mirror acknowledged inverter frames through SOCKS5 in isolation."""
 
@@ -309,11 +366,18 @@ class CloudForwarder:
         self.incoming_handler = incoming_handler
         self.fake_ack_cloud_writes = fake_ack_cloud_writes
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_size)
-        self._generated_replies: deque[bytes] = deque(
+        self._generated_replies: deque[GeneratedCloudFrame] = deque(
             maxlen=GENERATED_REPLY_QUEUE_SIZE
         )
+        self._scheduled_replies: deque[tuple[float, GeneratedCloudFrame]] = deque(
+            maxlen=GENERATED_REPLY_QUEUE_SIZE
+        )
+        self._state_lock = threading.Lock()
         self._latest_device_timestamp: Optional[bytes] = None
         self._latest_device_timestamp_observed_at: Optional[float] = None
+        self._latest_configuration_frame: Optional[bytes] = None
+        self._shadow_registers: dict[int, int] = {}
+        self._pending_shadow_confirmations: dict[tuple[bytes, bytes], int] = {}
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -332,9 +396,32 @@ class CloudForwarder:
     def enqueue(self, frame: bytes) -> None:
         """Queue one copy without waiting for SOCKS, DNS, cloud, or disk I/O."""
 
-        if len(frame) >= 32 and frame[6:8] in CLOUD_TELEMETRY_ACK_TYPES:
-            self._latest_device_timestamp = frame[26:32]
-            self._latest_device_timestamp_observed_at = time.monotonic()
+        message_type = frame[6:8] if len(frame) >= 8 else b""
+        if len(frame) >= 32 and message_type in CLOUD_TELEMETRY_ACK_TYPES:
+            with self._state_lock:
+                self._latest_device_timestamp = frame[26:32]
+                self._latest_device_timestamp_observed_at = time.monotonic()
+                if message_type == b"\x01\x03":
+                    # Keep the real frame as the source for later cloud-only
+                    # shadow snapshots. Never feed a patched copy back here.
+                    self._latest_configuration_frame = frame
+                shadow_registers = dict(self._shadow_registers)
+            if shadow_registers:
+                try:
+                    cloud_frame, patched_addresses = patch_register_snapshot(
+                        frame,
+                        shadow_registers,
+                    )
+                except ValueError as error:
+                    logging.error("could not apply cloud register shadow: %s", error)
+                else:
+                    if patched_addresses:
+                        frame = cloud_frame
+                        logging.info(
+                            "cloud-bound frame shadowed: type=%s registers=%s",
+                            message_type.hex(":"),
+                            ",".join(str(value) for value in patched_addresses),
+                        )
 
         try:
             self._queue.put_nowait(frame)
@@ -456,6 +543,94 @@ class CloudForwarder:
                 command.padding.hex(),
             )
 
+    def _current_device_timestamp(self) -> bytes:
+        with self._state_lock:
+            timestamp = self._latest_device_timestamp
+            observed_at = self._latest_device_timestamp_observed_at
+        if timestamp is not None and observed_at is not None:
+            try:
+                return advance_device_timestamp(
+                    timestamp,
+                    time.monotonic() - observed_at,
+                )
+            except ValueError as error:
+                logging.warning(
+                    "could not advance cached inverter timestamp: %s; "
+                    "using local clock",
+                    error,
+                )
+
+        local_now = datetime.now().astimezone()
+        return bytes(
+            (
+                local_now.year % 100,
+                local_now.month,
+                local_now.day,
+                local_now.hour,
+                local_now.minute,
+                local_now.second,
+            )
+        )
+
+    def _queue_generated(
+        self,
+        frame: bytes,
+        purpose: str,
+        delay: float = 0.0,
+    ) -> None:
+        generated = GeneratedCloudFrame(frame, purpose)
+        if delay > 0.0:
+            if len(self._scheduled_replies) == self._scheduled_replies.maxlen:
+                self._scheduled_replies.popleft()
+                logging.warning(
+                    "scheduled cloud-shadow queue discarded its oldest frame"
+                )
+            self._scheduled_replies.append((time.monotonic() + delay, generated))
+            return
+        if len(self._generated_replies) == self._generated_replies.maxlen:
+            self._generated_replies.popleft()
+            logging.warning("generated cloud-frame queue discarded its oldest frame")
+        self._generated_replies.append(generated)
+
+    def _track_shadow_confirmation(self, frame: bytes) -> None:
+        key = (frame[6:8], frame[26:32])
+        with self._state_lock:
+            self._pending_shadow_confirmations[key] = (
+                self._pending_shadow_confirmations.get(key, 0) + 1
+            )
+
+    def _consume_shadow_confirmation_ack(self, frame: bytes) -> bool:
+        if len(frame) < 30:
+            return False
+        # Cloud ACK frames omit the two reserved bytes present in inverter
+        # telemetry, so their matching timestamp is at bytes 24..29.
+        key = (frame[6:8], frame[24:30])
+        with self._state_lock:
+            count = self._pending_shadow_confirmations.get(key, 0)
+            if count == 0:
+                return False
+            if count == 1:
+                del self._pending_shadow_confirmations[key]
+            else:
+                self._pending_shadow_confirmations[key] = count - 1
+            remaining = sum(self._pending_shadow_confirmations.values())
+            if remaining == 0:
+                self._shadow_registers.clear()
+
+        logging.warning(
+            "cloud acknowledged shadow confirmation: type=%s device_time=%s "
+            "remaining=%d",
+            frame[6:8].hex(":"),
+            "20%02d-%02d-%02d %02d:%02d:%02d" % tuple(frame[24:30]),
+            remaining,
+        )
+        if remaining == 0:
+            logging.warning(
+                "cloud command confirmation complete; temporary register "
+                "shadow discarded"
+            )
+        return True
+
     def _route_cloud_frame(self, frame: bytes) -> str:
         message_type = frame[6:8] if len(frame) >= 8 else b""
         if len(frame) < 2 or _crc16_modbus(frame[:-2]) != int.from_bytes(
@@ -463,6 +638,8 @@ class CloudForwarder:
         ):
             return "ignored_invalid_crc"
         if message_type in CLOUD_TELEMETRY_ACK_TYPES:
+            if self._consume_shadow_confirmation_ack(frame):
+                return "shadow_confirmation_acknowledged"
             return "ignored_local_ack_already_sent"
         if self.incoming_handler is not None:
             try:
@@ -471,43 +648,82 @@ class CloudForwarder:
                 logging.error("cloud input router failed; frame ignored: %s", error)
                 return "ignored_router_error"
         if self.fake_ack_cloud_writes and message_type == CLOUD_WRITE_TYPE:
-            timestamp = self._latest_device_timestamp
-            observed_at = self._latest_device_timestamp_observed_at
-            if timestamp is not None and observed_at is not None:
-                try:
-                    timestamp = advance_device_timestamp(
-                        timestamp,
-                        time.monotonic() - observed_at,
-                    )
-                except ValueError as error:
-                    logging.warning(
-                        "could not advance cached inverter timestamp: %s; "
-                        "using local clock",
-                        error,
-                    )
-                    timestamp = None
-            if timestamp is None:
-                local_now = datetime.now().astimezone()
-                timestamp = bytes(
-                    (
-                        local_now.year % 100,
-                        local_now.month,
-                        local_now.day,
-                        local_now.hour,
-                        local_now.minute,
-                        local_now.second,
-                    )
-                )
+            timestamp = self._current_device_timestamp()
             try:
+                command = parse_cloud_write(frame)
                 acknowledgement = build_cloud_write_ack(frame, timestamp)
             except ValueError as error:
                 logging.error("could not build fake cloud-write ACK: %s", error)
                 return "ignored_fake_ack_error"
-            if len(self._generated_replies) == self._generated_replies.maxlen:
-                self._generated_replies.popleft()
-                logging.warning("fake cloud-ACK queue discarded its oldest reply")
-            self._generated_replies.append(acknowledgement)
-            return "fake_ack_queued"
+
+            with self._state_lock:
+                self._shadow_registers.update(
+                    zip(
+                        range(command.start, command.end + 1),
+                        command.values,
+                    )
+                )
+                shadow_registers = dict(self._shadow_registers)
+                configuration_frame = self._latest_configuration_frame
+
+            confirmation_count = 0
+            if configuration_frame is not None:
+                try:
+                    first_confirmation, first_patched = patch_register_snapshot(
+                        configuration_frame,
+                        shadow_registers,
+                        timestamp,
+                    )
+                    target_addresses = set(range(command.start, command.end + 1))
+                    if target_addresses.intersection(first_patched):
+                        second_timestamp = advance_device_timestamp(
+                            timestamp,
+                            SHADOW_CONFIRMATION_DELAY_SECONDS,
+                        )
+                        second_confirmation, _second_patched = (
+                            patch_register_snapshot(
+                                configuration_frame,
+                                shadow_registers,
+                                second_timestamp,
+                            )
+                        )
+                        self._queue_generated(
+                            first_confirmation,
+                            "shadow_confirmation",
+                        )
+                        self._track_shadow_confirmation(first_confirmation)
+                        confirmation_count += 1
+                        self._queue_generated(
+                            second_confirmation,
+                            "shadow_confirmation",
+                            SHADOW_CONFIRMATION_DELAY_SECONDS,
+                        )
+                        self._track_shadow_confirmation(second_confirmation)
+                        confirmation_count += 1
+                except ValueError as error:
+                    logging.error(
+                        "could not build cloud-shadow confirmation: %s",
+                        error,
+                    )
+            else:
+                logging.warning(
+                    "no cached 01:03 configuration frame is available for "
+                    "cloud-shadow confirmation"
+                )
+
+            # The genuine sequence puts the first refreshed 01:03 before the
+            # 01:10 command response, followed by a second 01:03 about two
+            # seconds later.
+            self._queue_generated(acknowledgement, "write_ack")
+            if confirmation_count == 0:
+                with self._state_lock:
+                    for address in range(command.start, command.end + 1):
+                        self._shadow_registers.pop(address, None)
+            return (
+                "fake_ack_and_shadow_queued"
+                if confirmation_count
+                else "fake_ack_queued"
+            )
         return "ignored"
 
     def _consume_incoming(self, buffer: bytearray) -> None:
@@ -560,7 +776,7 @@ class CloudForwarder:
         incoming_buffer = bytearray()
         pending_frame: Optional[bytes] = None
         pending_offset = 0
-        pending_generated_reply = False
+        pending_generated_purpose: Optional[str] = None
         activated = False
         reconnect_delay = 0.0
         next_connect_at = 0.0
@@ -568,16 +784,30 @@ class CloudForwarder:
         connected_at: Optional[float] = None
 
         while not self._stop_event.is_set():
+            now = time.monotonic()
+            while (
+                self._scheduled_replies
+                and self._scheduled_replies[0][0] <= now
+            ):
+                _send_at, generated = self._scheduled_replies.popleft()
+                if len(self._generated_replies) == self._generated_replies.maxlen:
+                    self._generated_replies.popleft()
+                    logging.warning(
+                        "generated cloud-frame queue discarded its oldest frame"
+                    )
+                self._generated_replies.append(generated)
+
             if pending_frame is None:
                 if self._generated_replies:
-                    pending_frame = self._generated_replies.popleft()
+                    generated = self._generated_replies.popleft()
+                    pending_frame = generated.frame
                     pending_offset = 0
-                    pending_generated_reply = True
+                    pending_generated_purpose = generated.purpose
                 else:
                     try:
                         pending_frame = self._queue.get_nowait()
                         pending_offset = 0
-                        pending_generated_reply = False
+                        pending_generated_purpose = None
                         activated = True
                     except queue.Empty:
                         pass
@@ -644,7 +874,7 @@ class CloudForwarder:
                         raise ConnectionError("cloud socket accepted no outgoing bytes")
                     pending_offset += written
                     if pending_offset == len(pending_frame):
-                        if pending_generated_reply:
+                        if pending_generated_purpose == "write_ack":
                             logging.warning(
                                 "fake cloud-write ACK sent to socket: type=%s "
                                 "length=%d device_time=%s sha256=%s",
@@ -661,6 +891,21 @@ class CloudForwarder:
                                     "fake cloud-write ACK frame_base64=%s",
                                     base64.b64encode(pending_frame).decode("ascii"),
                                 )
+                        elif pending_generated_purpose == "shadow_confirmation":
+                            logging.warning(
+                                "cloud-shadow confirmation sent to socket: "
+                                "type=%s length=%d device_time=%s sha256=%s",
+                                pending_frame[6:8].hex(":"),
+                                len(pending_frame),
+                                "20%02d-%02d-%02d %02d:%02d:%02d"
+                                % tuple(pending_frame[26:32]),
+                                hashlib.sha256(pending_frame).hexdigest(),
+                            )
+                            if self.verbose_registers:
+                                logging.info(
+                                    "cloud-shadow confirmation frame_base64=%s",
+                                    base64.b64encode(pending_frame).decode("ascii"),
+                                )
                         else:
                             logging.info(
                                 "cloud mirror forwarded frame: type=%s length=%d",
@@ -671,7 +916,7 @@ class CloudForwarder:
                             )
                         pending_frame = None
                         pending_offset = 0
-                        pending_generated_reply = False
+                        pending_generated_purpose = None
 
                 if connection in readable:
                     incoming = connection.recv(65536)
@@ -695,11 +940,15 @@ class CloudForwarder:
                 # A partially transmitted TCP frame is retried whole after
                 # reconnect. A generated reply belongs to the old cloud session
                 # and is instead discarded.
-                if pending_generated_reply:
+                if pending_generated_purpose is not None:
                     pending_frame = None
-                    pending_generated_reply = False
+                    pending_generated_purpose = None
                 pending_offset = 0
                 self._generated_replies.clear()
+                self._scheduled_replies.clear()
+                with self._state_lock:
+                    self._shadow_registers.clear()
+                    self._pending_shadow_confirmations.clear()
                 next_connect_at = time.monotonic() + reconnect_delay
                 reconnect_delay = (
                     0.1

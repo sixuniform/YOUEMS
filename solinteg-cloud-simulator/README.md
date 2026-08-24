@@ -220,6 +220,20 @@ outgoing telemetry frame, advances it using monotonic elapsed time, and uses
 the local clock only before a valid device timestamp has been observed. Reusing
 the cached timestamp unchanged did not complete the first cloud-UI test.
 
+A later full-communication capture showed that the `01:10` reply is only one
+part of cloud-side command confirmation. After applying a write, the genuine
+inverter sent this sequence:
+
+1. a refreshed `01:03` configuration snapshot showing the new register value;
+2. the genuine `01:10` command response;
+3. another refreshed `01:03` approximately two seconds later.
+
+The cloud acknowledged both `01:03` snapshots, and the cloud UI reported
+success shortly afterwards. The normal minute-cadence `01:04` frame was not
+the command confirmation. Fake-ACK mode therefore reproduces the observed
+`01:03` → `01:10` → `01:03` sequence using cloud-only copies; it does not send
+the blocked register write or patched snapshots to the inverter.
+
 ### Relationship to the Modbus delays
 
 When a TCP sink accepted the connection but returned no application reply, the
@@ -379,7 +393,7 @@ the default:
 |---|:---:|:---:|:---:|
 | No `--forward-socks5` | No | No | No cloud connection |
 | `--forward-socks5 HOST:PORT` | Yes | No | No |
-| Add `--fake-ack-cloud-commands` | Yes | No | Yes |
+| Add `--fake-ack-cloud-commands` | Yes | No | Yes, with temporary `01:03` confirmation |
 | Add `--allow-cloud-commands` | Yes | Yes | No; genuine inverter reply is relayed |
 
 In every mode, inverter telemetry is acknowledged locally before any logging
@@ -505,8 +519,21 @@ python3 solinteg-cloud-simulator.py \
 ```
 
 In this mode, a valid `01:10` cloud write is decoded and logged but never
-placed on the inverter connection. The simulator returns the genuine 58-byte
-success-ACK format described above over the existing SOCKS5 connection.
+placed on the inverter connection. The simulator temporarily remembers its
+register words, clones the latest real `01:03` configuration frame, changes
+only matching register words in the cloud copy, and reproduces the observed
+confirmation sequence:
+
+1. patched cloud-only `01:03` configuration snapshot;
+2. genuine-format 58-byte `01:10` success response;
+3. a second patched cloud-only `01:03` approximately two seconds later.
+
+When the cloud acknowledges both generated `01:03` frames, the temporary
+register shadow is immediately discarded. Later genuine frames therefore
+return to the inverter's real values; the simulator does not maintain a
+persistent fictional state. If the commanded register is absent from the
+cached configuration snapshot, only the `01:10` response is generated.
+
 Normal telemetry acknowledgements from the cloud remain suppressed because
 the simulator has already acknowledged those frames locally. Unknown cloud
 frame types remain logged and ignored.
@@ -515,12 +542,15 @@ frame types remain logged and ignored.
 exclusive. The cloud UI may report that a blocked setting change succeeded
 even though the inverter was deliberately left unchanged. Use this mode only
 when that distinction is understood. The cloud-input JSONL action is
-`fake_ack_queued`; successful transmission of the generated response is also
-recorded in the console or journal with its device timestamp and SHA-256. With
-`--verbose`, the complete generated response is additionally logged as base64
-for protocol diagnosis. “Sent to socket” means that the complete frame was
-accepted by the local TCP stack; the cloud may still require subsequent
-telemetry to confirm that the requested setting actually changed.
+`fake_ack_and_shadow_queued` when matching configuration registers were found.
+The cloud acknowledgements are recorded as
+`shadow_confirmation_acknowledged`; after the final one, the console records
+that the temporary register shadow was discarded. Successful transmission of
+each generated frame is logged with its device timestamp and SHA-256. With
+`--verbose`, complete generated frames are additionally logged as base64 for
+protocol diagnosis. “Sent to socket” means that the complete frame was
+accepted by the local TCP stack, not by itself that the cloud accepted the
+application transaction.
 
 ## Enabling options under systemd
 
