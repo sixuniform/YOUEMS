@@ -213,7 +213,10 @@ while direct writes through the inverter's public Modbus interface should be
 verified cautiously on each firmware version.
 
 The controlled writes also captured their genuine inverter acknowledgements.
-For the observed 58-byte `01:10` commands, the reply has this exact layout:
+Single-register requests were 58 bytes, while a seven-register TOU request was
+74 bytes. The success reply is fixed at 58 bytes in both cases: it preserves
+the target range but replaces all request values with one status byte and
+padding. It has this exact layout:
 
 | Offset | Size | Acknowledgement field |
 |---:|---:|---|
@@ -225,7 +228,8 @@ For the observed 58-byte `01:10` commands, the reply has this exact layout:
 | 45 | 11 bytes | `FF` padding |
 | 56 | 2 bytes | Recalculated CRC-16/Modbus, low byte first |
 
-This transformation reproduced both captured genuine inverter replies exactly.
+This transformation reproduced the captured genuine single-register inverter
+replies exactly and is also used for variable-length multi-register requests.
 The command timestamp itself is not echoed: the inverter used its current
 timestamp. The simulator therefore caches the timestamp from the latest
 outgoing telemetry frame, advances it using monotonic elapsed time, and uses

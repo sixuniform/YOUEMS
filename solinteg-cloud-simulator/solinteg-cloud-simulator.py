@@ -679,6 +679,42 @@ def run_self_test() -> None:
         fake_cloud_ack[-2:], "little"
     ):
         raise AssertionError("fake cloud ACK CRC test failed")
+
+    multi_write_values = (2, 0, 0, 1000, 0, 0x1600, 0x170E)
+    multi_write_body = b"".join(
+        (
+            MAGIC,
+            (65).to_bytes(4, "big"),
+            b"\x01\x10",
+            serial,
+            timestamp,
+            b"\x00" * 10,
+            struct.pack(">HH", 53007, 53013),
+            struct.pack(">7H", *multi_write_values),
+            b"\xff" * 14,
+        )
+    )
+    multi_write_frame = multi_write_body + struct.pack(
+        "<H", crc16_modbus(multi_write_body)
+    )
+    if len(multi_write_frame) != 74:
+        raise AssertionError("multi-register cloud write length test failed")
+    parsed_multi_write = parse_cloud_write(multi_write_frame)
+    if parsed_multi_write.values != multi_write_values:
+        raise AssertionError("multi-register cloud write value test failed")
+    fake_multi_ack = build_cloud_write_ack(multi_write_frame, fake_ack_timestamp)
+    if len(fake_multi_ack) != ACK_TOTAL_LENGTH:
+        raise AssertionError("multi-register fake cloud ACK length test failed")
+    if fake_multi_ack[2:6] != ACK_DECLARED_LENGTH.to_bytes(4, "big"):
+        raise AssertionError("multi-register fake cloud ACK declared-length test failed")
+    if fake_multi_ack[40:44] != multi_write_frame[40:44]:
+        raise AssertionError("multi-register fake cloud ACK range test failed")
+    if fake_multi_ack[44:56] != b"\x01" + b"\xff" * 11:
+        raise AssertionError("multi-register fake cloud ACK status test failed")
+    if crc16_modbus(fake_multi_ack[:-2]) != int.from_bytes(
+        fake_multi_ack[-2:], "little"
+    ):
+        raise AssertionError("multi-register fake cloud ACK CRC test failed")
     advanced_timestamp = advance_device_timestamp(
         bytes((26, 8, 23, 23, 59, 58)),
         5.9,

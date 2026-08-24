@@ -39,6 +39,8 @@ MAX_RECONNECT_DELAY_SECONDS: Final = 30.0
 GENERATED_REPLY_QUEUE_SIZE: Final = 64
 SHADOW_CONFIRMATION_DELAY_SECONDS: Final = 2.0
 DEFAULT_SHADOW_RETENTION_SECONDS: Final = 60.0
+CLOUD_WRITE_ACK_DECLARED_LENGTH: Final = 49
+CLOUD_WRITE_ACK_TOTAL_LENGTH: Final = 58
 CLOUD_TELEMETRY_ACK_TYPES: Final = frozenset(
     (b"\x01\x03", b"\x01\x04", b"\x01\x44")
 )
@@ -235,28 +237,30 @@ def _crc16_modbus(data: bytes) -> int:
 def build_cloud_write_ack(command: bytes, device_timestamp: bytes) -> bytes:
     """Build the genuine 58-byte inverter acknowledgement for an 01:10 write."""
 
-    if len(command) != 58:
-        raise ValueError(f"cloud write is {len(command)} bytes, expected 58")
     parse_cloud_write(command)
+    if int.from_bytes(command[2:6], "big") + 9 != len(command):
+        raise ValueError("cloud write has an invalid declared length")
     if _crc16_modbus(command[:-2]) != int.from_bytes(command[-2:], "little"):
         raise ValueError("cloud write has invalid CRC")
     if len(device_timestamp) != 6:
         raise ValueError("device timestamp must contain six bytes")
 
-    # Genuine inverter replies preserve the command header, identifier,
-    # reserved bytes and target range. They replace the command timestamp,
-    # replace all register values with one-byte status 01, pad with FF, and
-    # calculate a new CRC over the 56-byte body.
+    # Genuine inverter replies preserve the command type, identifier, reserved
+    # bytes and target range. The request may grow with its register count, but
+    # the reply collapses all values to one-byte status 01 plus FF padding and
+    # is therefore always 58 bytes. Its declared length must be rewritten too.
     body = b"".join(
         (
-            command[:24],
+            command[:2],
+            CLOUD_WRITE_ACK_DECLARED_LENGTH.to_bytes(4, "big"),
+            command[6:24],
             device_timestamp,
             command[30:44],
             b"\x01",
             b"\xff" * 11,
         )
     )
-    if len(body) != 56:
+    if len(body) != CLOUD_WRITE_ACK_TOTAL_LENGTH - 2:
         raise AssertionError("internal cloud-write acknowledgement length error")
     return body + struct.pack("<H", _crc16_modbus(body))
 
