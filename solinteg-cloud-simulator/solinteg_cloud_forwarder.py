@@ -22,6 +22,7 @@ import socket
 import struct
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Final, NamedTuple, Optional
@@ -35,6 +36,7 @@ DEFAULT_QUEUE_SIZE: Final = 256
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 SELECT_TIMEOUT_SECONDS: Final = 0.25
 MAX_RECONNECT_DELAY_SECONDS: Final = 30.0
+GENERATED_REPLY_QUEUE_SIZE: Final = 64
 CLOUD_TELEMETRY_ACK_TYPES: Final = frozenset(
     (b"\x01\x03", b"\x01\x04", b"\x01\x44")
 )
@@ -221,6 +223,35 @@ def _crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
+def build_cloud_write_ack(command: bytes, device_timestamp: bytes) -> bytes:
+    """Build the genuine 58-byte inverter acknowledgement for an 01:10 write."""
+
+    if len(command) != 58:
+        raise ValueError(f"cloud write is {len(command)} bytes, expected 58")
+    parse_cloud_write(command)
+    if _crc16_modbus(command[:-2]) != int.from_bytes(command[-2:], "little"):
+        raise ValueError("cloud write has invalid CRC")
+    if len(device_timestamp) != 6:
+        raise ValueError("device timestamp must contain six bytes")
+
+    # Genuine inverter replies preserve the command header, identifier,
+    # reserved bytes and target range. They replace the command timestamp,
+    # replace all register values with one-byte status 01, pad with FF, and
+    # calculate a new CRC over the 56-byte body.
+    body = b"".join(
+        (
+            command[:24],
+            device_timestamp,
+            command[30:44],
+            b"\x01",
+            b"\xff" * 11,
+        )
+    )
+    if len(body) != 56:
+        raise AssertionError("internal cloud-write acknowledgement length error")
+    return body + struct.pack("<H", _crc16_modbus(body))
+
+
 class CloudForwarder:
     """Mirror acknowledged inverter frames through SOCKS5 in isolation."""
 
@@ -234,6 +265,7 @@ class CloudForwarder:
         queue_size: int = DEFAULT_QUEUE_SIZE,
         verbose_registers: bool = False,
         incoming_handler: Optional[Callable[[bytes], str]] = None,
+        fake_ack_cloud_writes: bool = False,
     ) -> None:
         self.proxy = proxy
         self.target = target
@@ -242,7 +274,12 @@ class CloudForwarder:
         self.password = password
         self.verbose_registers = verbose_registers
         self.incoming_handler = incoming_handler
+        self.fake_ack_cloud_writes = fake_ack_cloud_writes
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_size)
+        self._generated_replies: deque[bytes] = deque(
+            maxlen=GENERATED_REPLY_QUEUE_SIZE
+        )
+        self._latest_device_timestamp: Optional[bytes] = None
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -260,6 +297,9 @@ class CloudForwarder:
 
     def enqueue(self, frame: bytes) -> None:
         """Queue one copy without waiting for SOCKS, DNS, cloud, or disk I/O."""
+
+        if len(frame) >= 32 and frame[6:8] in CLOUD_TELEMETRY_ACK_TYPES:
+            self._latest_device_timestamp = frame[26:32]
 
         try:
             self._queue.put_nowait(frame)
@@ -389,13 +429,37 @@ class CloudForwarder:
             return "ignored_invalid_crc"
         if message_type in CLOUD_TELEMETRY_ACK_TYPES:
             return "ignored_local_ack_already_sent"
-        if self.incoming_handler is None:
-            return "ignored"
-        try:
-            return self.incoming_handler(frame)
-        except Exception as error:
-            logging.error("cloud input router failed; frame ignored: %s", error)
-            return "ignored_router_error"
+        if self.incoming_handler is not None:
+            try:
+                return self.incoming_handler(frame)
+            except Exception as error:
+                logging.error("cloud input router failed; frame ignored: %s", error)
+                return "ignored_router_error"
+        if self.fake_ack_cloud_writes and message_type == CLOUD_WRITE_TYPE:
+            timestamp = self._latest_device_timestamp
+            if timestamp is None:
+                local_now = datetime.now().astimezone()
+                timestamp = bytes(
+                    (
+                        local_now.year % 100,
+                        local_now.month,
+                        local_now.day,
+                        local_now.hour,
+                        local_now.minute,
+                        local_now.second,
+                    )
+                )
+            try:
+                acknowledgement = build_cloud_write_ack(frame, timestamp)
+            except ValueError as error:
+                logging.error("could not build fake cloud-write ACK: %s", error)
+                return "ignored_fake_ack_error"
+            if len(self._generated_replies) == self._generated_replies.maxlen:
+                self._generated_replies.popleft()
+                logging.warning("fake cloud-ACK queue discarded its oldest reply")
+            self._generated_replies.append(acknowledgement)
+            return "fake_ack_queued"
+        return "ignored"
 
     def _consume_incoming(self, buffer: bytearray) -> None:
         while buffer:
@@ -447,6 +511,7 @@ class CloudForwarder:
         incoming_buffer = bytearray()
         pending_frame: Optional[bytes] = None
         pending_offset = 0
+        pending_generated_reply = False
         activated = False
         reconnect_delay = 0.0
         next_connect_at = 0.0
@@ -455,12 +520,18 @@ class CloudForwarder:
 
         while not self._stop_event.is_set():
             if pending_frame is None:
-                try:
-                    pending_frame = self._queue.get_nowait()
+                if self._generated_replies:
+                    pending_frame = self._generated_replies.popleft()
                     pending_offset = 0
-                    activated = True
-                except queue.Empty:
-                    pass
+                    pending_generated_reply = True
+                else:
+                    try:
+                        pending_frame = self._queue.get_nowait()
+                        pending_offset = 0
+                        pending_generated_reply = False
+                        activated = True
+                    except queue.Empty:
+                        pass
 
             if self._dropped_frames != reported_drops:
                 difference = self._dropped_frames - reported_drops
@@ -524,15 +595,27 @@ class CloudForwarder:
                         raise ConnectionError("cloud socket accepted no outgoing bytes")
                     pending_offset += written
                     if pending_offset == len(pending_frame):
-                        logging.info(
-                            "cloud mirror forwarded frame: type=%s length=%d",
-                            pending_frame[6:8].hex(":")
-                            if len(pending_frame) >= 8
-                            else "unknown",
-                            len(pending_frame),
-                        )
+                        if pending_generated_reply:
+                            logging.warning(
+                                "fake cloud-write ACK sent: type=%s length=%d "
+                                "sha256=%s",
+                                pending_frame[6:8].hex(":")
+                                if len(pending_frame) >= 8
+                                else "unknown",
+                                len(pending_frame),
+                                hashlib.sha256(pending_frame).hexdigest(),
+                            )
+                        else:
+                            logging.info(
+                                "cloud mirror forwarded frame: type=%s length=%d",
+                                pending_frame[6:8].hex(":")
+                                if len(pending_frame) >= 8
+                                else "unknown",
+                                len(pending_frame),
+                            )
                         pending_frame = None
                         pending_offset = 0
+                        pending_generated_reply = False
 
                 if connection in readable:
                     incoming = connection.recv(65536)
@@ -554,8 +637,13 @@ class CloudForwarder:
                     reconnect_delay = 0.0
                 connected_at = None
                 # A partially transmitted TCP frame is retried whole after
-                # reconnect.  The real endpoint already tolerates retransmission.
+                # reconnect. A generated reply belongs to the old cloud session
+                # and is instead discarded.
+                if pending_generated_reply:
+                    pending_frame = None
+                    pending_generated_reply = False
                 pending_offset = 0
+                self._generated_replies.clear()
                 next_connect_at = time.monotonic() + reconnect_delay
                 reconnect_delay = (
                     0.1

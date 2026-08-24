@@ -12,7 +12,9 @@ It can optionally mirror a copy of each acknowledged inverter frame to the
 real cloud through a SOCKS5 proxy. This forwarding path is deliberately
 one-way by default: bytes received from the cloud are logged and ignored. A
 separate, explicit test switch can temporarily forward cloud commands while
-their real inverter responses are being reverse engineered.
+their real inverter responses are being reverse engineered. Another explicit
+mode keeps `01:10` writes blocked but returns a locally generated success
+acknowledgement to the cloud.
 
 This is **not** a Modbus simulator. It does not read or write inverter
 registers. Its purpose is to keep cloud telemetry work from blocking the
@@ -198,6 +200,25 @@ then matched the existing Broker v5.12 register names, enum values, and scale
 exactly. An identical mode command was observed more than once, consistent
 with the cloud retrying when its command received no inverter acknowledgement.
 
+The controlled writes also captured their genuine inverter acknowledgements.
+For the observed 58-byte `01:10` commands, the reply has this exact layout:
+
+| Offset | Size | Acknowledgement field |
+|---:|---:|---|
+| 0 | 24 bytes | Original magic, length, type, and module identifier |
+| 24 | 6 bytes | Most recent inverter/module timestamp |
+| 30 | 10 bytes | Original reserved bytes |
+| 40 | 4 bytes | Original first and last target registers |
+| 44 | 1 byte | Status `01` (success) |
+| 45 | 11 bytes | `FF` padding |
+| 56 | 2 bytes | Recalculated CRC-16/Modbus, low byte first |
+
+This transformation reproduced both captured genuine inverter replies exactly.
+The command timestamp itself is not echoed: the inverter used its current
+timestamp. The simulator therefore caches the timestamp from the latest
+outgoing telemetry frame and uses the local clock only before such a timestamp
+has been observed.
+
 ### Relationship to the Modbus delays
 
 When a TCP sink accepted the connection but returned no application reply, the
@@ -350,6 +371,21 @@ example `--log-unknown /tmp/unknown-frames.jsonl`.
 
 ## One-way SOCKS5 cloud mirror
 
+Cloud behavior is selected by command-line options; local-only operation is
+the default:
+
+| Options | Telemetry sent to cloud | Cloud writes reach inverter | Cloud writes fake-ACKed |
+|---|:---:|:---:|:---:|
+| No `--forward-socks5` | No | No | No cloud connection |
+| `--forward-socks5 HOST:PORT` | Yes | No | No |
+| Add `--fake-ack-cloud-commands` | Yes | No | Yes |
+| Add `--allow-cloud-commands` | Yes | Yes | No; genuine inverter reply is relayed |
+
+In every mode, inverter telemetry is acknowledged locally before any logging
+or remote work. Omitting `--forward-socks5` therefore preserves the original
+cloud-free simulator: nothing is uploaded and only the local acknowledgement
+is generated.
+
 Enable the mirror by giving the proxy endpoint. The real cloud target defaults
 to `iot.solinteg-cloud.com:5743`:
 
@@ -367,7 +403,8 @@ proxy:
 4. A separate thread opens a long-lived SOCKS5 connection and forwards queued
    frames in order.
 5. Everything received from the cloud is logged. Telemetry acknowledgements
-   and commands are ignored unless command forwarding is explicitly enabled.
+   and commands are ignored unless command forwarding or fake command
+   acknowledgement is explicitly enabled.
 
 The queue holds at most 256 frames. If the remote route remains unavailable
 long enough to fill it, the oldest telemetry is discarded in favour of newer
@@ -409,9 +446,10 @@ silently lost when the remote connection closes or a new server message format
 appears. Each JSON Lines record contains receive time, direction, action,
 record kind, target, length, SHA-256, and the complete bytes as base64.
 Recognised `ST` framing also records the two-byte type and CRC validity. The
-action distinguishes ignored local acknowledgements, blocked commands,
-commands queued for the inverter, invalid input, and routing failures. The
-path can be changed with `--cloud-incoming-log PATH`.
+action distinguishes ignored local acknowledgements, blocked commands, fake
+acknowledgements queued for the cloud, commands queued for the inverter,
+invalid input, and routing failures. The path can be changed with
+`--cloud-incoming-log PATH`.
 
 To reconstruct the newest cloud frame:
 
@@ -453,10 +491,31 @@ restart commands, and power-limit changes. It is disabled by default and is
 incompatible with `--strict-known-types`. Stop the process and restart without
 `--allow-cloud-commands` to return immediately to log-and-ignore operation.
 
-No fabricated acknowledgement is currently sent to the cloud. The purpose of
-this mode is to capture genuine inverter acknowledgements first, so a later
-fake-ACK implementation can reproduce them exactly while keeping commands
-blocked.
+### Opt-in fake command acknowledgements
+
+To keep cloud writes away from the inverter while making the cloud transaction
+finish successfully, enable:
+
+```bash
+python3 solinteg-cloud-simulator.py \
+  --bind 192.168.10.50 --port 5743 \
+  --forward-socks5 192.168.0.1:1080 \
+  --fake-ack-cloud-commands --verbose
+```
+
+In this mode, a valid `01:10` cloud write is decoded and logged but never
+placed on the inverter connection. The simulator returns the genuine 58-byte
+success-ACK format described above over the existing SOCKS5 connection.
+Normal telemetry acknowledgements from the cloud remain suppressed because
+the simulator has already acknowledged those frames locally. Unknown cloud
+frame types remain logged and ignored.
+
+`--fake-ack-cloud-commands` and `--allow-cloud-commands` are mutually
+exclusive. The cloud UI may report that a blocked setting change succeeded
+even though the inverter was deliberately left unchanged. Use this mode only
+when that distinction is understood. The cloud-input JSONL action is
+`fake_ack_queued`; successful transmission of the generated response is also
+recorded in the console or journal with its SHA-256.
 
 ## Enabling options under systemd
 
@@ -557,10 +616,11 @@ With cloud mirroring disabled, redirecting the endpoint disables delivery of
 the intercepted telemetry to the vendor. With mirroring enabled, telemetry is
 sent but cloud-to-inverter messages are suppressed by default. Enabling
 `--allow-cloud-commands` permits the vendor cloud to perform real register
-writes on the inverter. These modes may affect cloud monitoring, remote
-diagnostics, controls, firmware services, warranty support, or safety
-notifications. Keep local monitoring and a tested rollback path. Do not expose
-the simulator listener or SOCKS proxy to untrusted networks.
+writes on the inverter. Enabling `--fake-ack-cloud-commands` instead reports
+those writes as successful without applying them. These modes may affect cloud
+monitoring, remote diagnostics, controls, firmware services, warranty support,
+or safety notifications. Keep local monitoring and a tested rollback path. Do
+not expose the simulator listener or SOCKS proxy to untrusted networks.
 
 The simulator normally logs the communication-module serial number, message
 type, frame length, and device timestamp to the system journal. `--verbose`

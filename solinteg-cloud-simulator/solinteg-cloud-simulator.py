@@ -9,7 +9,7 @@ redirects the inverter communication module's connection to
 returns the 58-byte application acknowledgement observed from the real
 Solinteg server.  An optional isolated worker can mirror acknowledged frames
 to the real endpoint through SOCKS5. Cloud input is always logged and is
-ignored unless explicit command-forwarding test mode is enabled.
+ignored unless an explicit command-forwarding or fake-ACK test mode is enabled.
 
 Observed request families: 01:03, 01:04, and 01:44.
 
@@ -39,7 +39,12 @@ from pathlib import Path
 from typing import Final, NamedTuple, Optional
 
 from solinteg_modbus_map import decode_register_range
-from solinteg_cloud_forwarder import CloudForwarder, parse_cloud_write, parse_endpoint
+from solinteg_cloud_forwarder import (
+    CloudForwarder,
+    build_cloud_write_ack,
+    parse_cloud_write,
+    parse_endpoint,
+)
 
 
 MAGIC: Final = b"ST"
@@ -647,12 +652,30 @@ def run_self_test() -> None:
     decoded_limit = list(decode_register_range(cloud_write.start, cloud_write.values))
     if len(decoded_limit) != 1 or decoded_limit[0].value != "13.7 kW":
         raise AssertionError("cloud write register-value test failed")
+    fake_ack_timestamp = bytes((26, 8, 23, 22, 21, 57))
+    fake_cloud_ack = build_cloud_write_ack(cloud_write_frame, fake_ack_timestamp)
+    if fake_cloud_ack[24:30] != fake_ack_timestamp:
+        raise AssertionError("fake cloud ACK timestamp test failed")
+    if fake_cloud_ack[40:44] != cloud_write_frame[40:44]:
+        raise AssertionError("fake cloud ACK register-range test failed")
+    if fake_cloud_ack[44:56] != b"\x01" + b"\xff" * 11:
+        raise AssertionError("fake cloud ACK status/padding test failed")
+    if crc16_modbus(fake_cloud_ack[:-2]) != int.from_bytes(
+        fake_cloud_ack[-2:], "little"
+    ):
+        raise AssertionError("fake cloud ACK CRC test failed")
     print("Self-test passed")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Locally acknowledge Solinteg cloud telemetry frames."
+        description="Locally acknowledge Solinteg cloud telemetry frames.",
+        epilog=(
+            "Cloud modes: omit --forward-socks5 for local-only fake ACKs; "
+            "use --forward-socks5 to upload telemetry while blocking cloud "
+            "commands; add --fake-ack-cloud-commands to report blocked writes "
+            "successful; or add --allow-cloud-commands to relay real writes."
+        ),
     )
     parser.add_argument(
         "--bind",
@@ -709,6 +732,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fake-ack-cloud-commands",
+        action="store_true",
+        help=(
+            "block 01:10 cloud writes but return a synthetic success ACK based "
+            "on genuine inverter replies"
+        ),
+    )
+    parser.add_argument(
         "--forward-target",
         default=DEFAULT_CLOUD_TARGET,
         metavar="HOST:PORT",
@@ -742,6 +773,13 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"invalid --forward-socks5 value: {error}")
     if args.allow_cloud_commands and args.forward_socks5 is None:
         parser.error("--allow-cloud-commands requires --forward-socks5")
+    if args.fake_ack_cloud_commands and args.forward_socks5 is None:
+        parser.error("--fake-ack-cloud-commands requires --forward-socks5")
+    if args.fake_ack_cloud_commands and args.allow_cloud_commands:
+        parser.error(
+            "--fake-ack-cloud-commands cannot be combined with "
+            "--allow-cloud-commands"
+        )
     if args.allow_cloud_commands and args.strict_known_types:
         parser.error(
             "--allow-cloud-commands cannot be combined with --strict-known-types"
@@ -786,6 +824,7 @@ def main() -> int:
                 if cloud_command_router is not None
                 else None
             ),
+            fake_ack_cloud_writes=args.fake_ack_cloud_commands,
         )
 
     try:
@@ -819,6 +858,14 @@ def main() -> int:
             logging.warning(
                 "FULL CLOUD COMMAND COMMUNICATION ENABLED: proxy=%s target=%s "
                 "incoming=%s; non-ACK cloud frames can control the inverter",
+                args.forward_socks5,
+                args.forward_target,
+                args.cloud_incoming_log,
+            )
+        elif args.fake_ack_cloud_commands:
+            logging.warning(
+                "FAKE CLOUD COMMAND ACKNOWLEDGEMENTS ENABLED: proxy=%s target=%s "
+                "incoming=%s; 01:10 writes are blocked but reported successful",
                 args.forward_socks5,
                 args.forward_target,
                 args.cloud_incoming_log,
