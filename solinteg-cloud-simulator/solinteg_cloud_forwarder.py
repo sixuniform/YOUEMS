@@ -45,6 +45,9 @@ CLOUD_TELEMETRY_ACK_TYPES: Final = frozenset(
     (b"\x01\x03", b"\x01\x04", b"\x01\x44")
 )
 CLOUD_WRITE_TYPE: Final = b"\x01\x10"
+CLOUD_ALWAYS_BLOCKED_TYPES: Final = {
+    b"\x01\x41": "Firmware Update / Other",
+}
 
 
 class Endpoint(NamedTuple):
@@ -467,6 +470,9 @@ class CloudForwarder:
         }
         if kind == "st_frame" and len(payload) >= 8:
             record["message_type"] = payload[6:8].hex(":")
+            message_description = CLOUD_ALWAYS_BLOCKED_TYPES.get(payload[6:8])
+            if message_description is not None:
+                record["message_description"] = message_description
             if len(payload) >= 2:
                 record["crc_valid"] = _crc16_modbus(payload[:-2]) == int.from_bytes(
                     payload[-2:], "little"
@@ -495,6 +501,15 @@ class CloudForwarder:
             message_type = payload[6:8] if len(payload) >= 8 else b""
             if message_type == CLOUD_WRITE_TYPE:
                 self._log_cloud_write(payload, action, record["sha256"])
+            elif message_type in CLOUD_ALWAYS_BLOCKED_TYPES:
+                logging.warning(
+                    "cloud frame unconditionally blocked and logged: type=%s "
+                    "description=%r length=%d sha256=%s",
+                    record.get("message_type", "unknown"),
+                    CLOUD_ALWAYS_BLOCKED_TYPES[message_type],
+                    len(payload),
+                    record["sha256"],
+                )
             else:
                 logging.info(
                     "cloud frame %s and logged: type=%s length=%d sha256=%s",
@@ -680,6 +695,10 @@ class CloudForwarder:
             if self._consume_shadow_confirmation_ack(frame):
                 return "shadow_confirmation_acknowledged"
             return "ignored_local_ack_already_sent"
+        # Never deliver or fake-ack commands that may initiate firmware work.
+        # This safety block deliberately overrides full-communication mode.
+        if message_type in CLOUD_ALWAYS_BLOCKED_TYPES:
+            return "blocked_firmware_update_or_other"
         if self.incoming_handler is not None:
             try:
                 return self.incoming_handler(frame)

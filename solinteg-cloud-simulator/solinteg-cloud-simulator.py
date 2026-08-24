@@ -715,6 +715,38 @@ def run_self_test() -> None:
         fake_multi_ack[-2:], "little"
     ):
         raise AssertionError("multi-register fake cloud ACK CRC test failed")
+
+    firmware_command_body = b"".join(
+        (
+            MAGIC,
+            (81).to_bytes(4, "big"),
+            b"\x01\x41",
+            serial,
+            b"\xaa" * 16,
+            b"\xff" * 48,
+        )
+    )
+    firmware_command = firmware_command_body + struct.pack(
+        "<H", crc16_modbus(firmware_command_body)
+    )
+    if len(firmware_command) != 90:
+        raise AssertionError("firmware-command frame length test failed")
+
+    def reject_unexpected_firmware_delivery(_frame: bytes) -> str:
+        raise AssertionError("firmware command reached the inverter router")
+
+    firmware_block_test = CloudForwarder(
+        proxy=parse_endpoint("127.0.0.1:1083"),
+        target=parse_endpoint("example.invalid:5743"),
+        incoming_log_file=Path("/tmp/unused-solinteg-cloud-input.jsonl"),
+        incoming_handler=reject_unexpected_firmware_delivery,
+        fake_ack_cloud_writes=True,
+    )
+    if (
+        firmware_block_test._route_cloud_frame(firmware_command)
+        != "blocked_firmware_update_or_other"
+    ):
+        raise AssertionError("firmware command unconditional-block test failed")
     advanced_timestamp = advance_device_timestamp(
         bytes((26, 8, 23, 23, 59, 58)),
         5.9,

@@ -494,6 +494,13 @@ sudo tail -n 1 \
 The normal 58-byte cloud acknowledgements are included. Remote control and
 configuration messages are recorded whether blocked or forwarded.
 
+Cloud type `01:41` has been observed when a remote firmware update was
+requested. Its exact payload remains partly unknown, so the simulator labels
+it **Firmware Update / Other** and unconditionally blocks it. The frame is
+saved to the cloud-input JSONL with action
+`blocked_firmware_update_or_other` and `message_description` set to that label.
+It is never fake-acknowledged and cannot be enabled by any forwarding option.
+
 ### Opt-in full command communication
 
 To learn the inverter's genuine response to cloud writes, temporarily enable:
@@ -509,6 +516,8 @@ python3 solinteg-cloud-simulator.py \
 
 - normal `01:03`, `01:04`, and `01:44` cloud acknowledgements remain blocked,
   because their corresponding local acknowledgements were already delivered;
+- cloud type `01:41` (**Firmware Update / Other**) remains unconditionally
+  blocked and logged, even in this mode;
 - valid cloud-initiated frames such as `01:10` are queued to the currently
   active inverter TCP connection;
 - the inverter-facing handler owns all writes to that LAN socket, so the SOCKS
