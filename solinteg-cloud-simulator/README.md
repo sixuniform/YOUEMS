@@ -170,7 +170,7 @@ endpoint strings; the other fields remain candidates:
 | `20007–20008` | Duplicate total generation energy, possibly matching `11020–11021` | Tentative |
 | `20010` | Work-hours counter | Tentative |
 | `20011` | Unknown serial-format/communication setting | Speculative |
-| `20012` | Modbus device ID | Tentative |
+| `20012` | Opaque communication parameter; observed as `247`, but not the Modbus TCP unit ID | Unknown |
 | `20016–20045` | Normal cloud endpoint ASCII field | Confirmed on Solinteg |
 | `20046–20075` | Technical endpoint ASCII field | Confirmed on Solinteg |
 | `20076–20087` | Opaque service values | Unknown |
@@ -196,6 +196,12 @@ python3 probe-undocumented-registers.py \
   --host 127.0.0.1 --port 502 --slave 255 \
   2>&1 | tee /tmp/solinteg-undocumented-registers.log
 ```
+
+For this interface the correct Modbus TCP unit ID is `255`. Although register
+`20012` has been observed with value `247`, reads addressed to unit `255` work
+and the Broker passes that unit unchanged to the inverter. The frequently
+repeated claim that clients should use unit `247` appears to come from
+misidentifying register `20012`; its actual purpose remains unknown.
 
 The raw word dump is followed by tentative interpretations and comparisons.
 The three credential-like fields are represented only by length and a short
