@@ -1,0 +1,1 @@
+../solinteg-cloud-simulator/solinteg_modbus_map.py
