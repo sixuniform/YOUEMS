@@ -347,9 +347,156 @@ REGISTER_METADATA = {
     20000: {'name': 'Inverter RTC Year/Month Setting', 'type': 'PACKED_YM', 'words': 1, 'scale': 1, 'unit': ''},
     20001: {'name': 'Inverter RTC Day/Hour Setting', 'type': 'PACKED_DH', 'words': 1, 'scale': 1, 'unit': ''},
     20002: {'name': 'Inverter RTC Minute/Second Setting', 'type': 'PACKED_MS', 'words': 1, 'scale': 1, 'unit': ''},
+    # Secondary service-register copies found by comparing one direct Solinteg
+    # read with the documented telemetry registers. Keep the one-device scope
+    # explicit until the layout has been confirmed on more firmware versions.
+    20007: {
+        'name': 'Energy AC Generation Total (Secondary)',
+        'type': 'U32',
+        'words': 2,
+        'scale': 0.1,
+        'unit': 'kWh',
+        'duplicate_of': 11020,
+        'source': 'empirical_modbus_read',
+        'confidence': 'confirmed_duplicate_on_one_device',
+    },
+    20010: {
+        'name': 'Total Generation Hours (Secondary)',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': 'h',
+        'duplicate_of': 11022,
+        'source': 'empirical_modbus_read',
+        'confidence': 'confirmed_duplicate_on_one_device',
+    },
+    20011: {
+        'name': 'Serial / Communication Format (Candidate)',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'speculative',
+    },
+    20012: {
+        'name': 'RS485 Device ID (Candidate)',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'map': {247: 'Reported default RS485 unit ID'},
+        'source': 'external_report_and_empirical_modbus_read',
+        'confidence': 'plausible_not_officially_confirmed',
+    },
     # Confirmed by a direct read from a Solinteg inverter on 2026-08-24.
-    20016: {'name': 'Normal Cloud Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': ''},
-    20046: {'name': 'Technical Service Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': ''},
+    20016: {'name': 'Normal Cloud Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': '', 'source': 'empirical_modbus_read', 'confidence': 'confirmed'},
+    20046: {'name': 'Technical Service Endpoint', 'type': 'STR', 'words': 30, 'scale': 1, 'unit': '', 'source': 'empirical_modbus_read', 'confidence': 'confirmed'},
+    # Three four-word ASCII fields contained credential-looking values. Their
+    # purpose and ordering are unknown, so do not assign installer/user roles.
+    20088: {
+        'name': 'Unknown Credential 1',
+        'type': 'STR',
+        'words': 4,
+        'scale': 1,
+        'unit': '',
+        'sensitive': True,
+        'source': 'empirical_modbus_read',
+        'confidence': 'confirmed_format_unknown_purpose',
+    },
+    20092: {
+        'name': 'Unknown Credential 2',
+        'type': 'STR',
+        'words': 4,
+        'scale': 1,
+        'unit': '',
+        'sensitive': True,
+        'source': 'empirical_modbus_read',
+        'confidence': 'confirmed_format_unknown_purpose',
+    },
+    20096: {
+        'name': 'Unknown Credential 3',
+        'type': 'STR',
+        'words': 4,
+        'scale': 1,
+        'unit': '',
+        'sensitive': True,
+        'source': 'empirical_modbus_read',
+        'confidence': 'confirmed_format_unknown_purpose',
+    },
+    20100: {
+        'name': 'Unknown Service Identifier',
+        'type': 'STR',
+        'words': 3,
+        'scale': 1,
+        'unit': '',
+        'source': 'empirical_modbus_read',
+        'confidence': 'confirmed_string_unknown_purpose',
+    },
+    # Tentative network settings reconstructed from one read and an M-TEC
+    # forum hypothesis. The observed static address did not match the active
+    # DHCP address, so these may be dormant/fallback settings. Writes have not
+    # been tested and must not be assumed safe.
+    20140: {
+        'name': 'Network Mode (Candidate)',
+        'type': 'U16',
+        'words': 1,
+        'scale': 1,
+        'unit': '',
+        'write_status': 'unverified_do_not_write',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'tentative',
+    },
+    20141: {
+        'name': 'Static IPv4 Address (Candidate)',
+        'type': 'IPV4',
+        'words': 2,
+        'scale': 1,
+        'unit': '',
+        'write_status': 'unverified_do_not_write',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'tentative',
+    },
+    20143: {
+        'name': 'IPv4 Gateway (Candidate)',
+        'type': 'IPV4',
+        'words': 2,
+        'scale': 1,
+        'unit': '',
+        'write_status': 'unverified_do_not_write',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'tentative',
+    },
+    20145: {
+        'name': 'IPv4 Network Mask (Candidate)',
+        'type': 'IPV4',
+        'words': 2,
+        'scale': 1,
+        'unit': '',
+        'write_status': 'unverified_do_not_write',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'tentative',
+    },
+    20147: {
+        'name': 'IPv4 DNS Server (Candidate)',
+        'type': 'IPV4',
+        'words': 2,
+        'scale': 1,
+        'unit': '',
+        'write_status': 'unverified_do_not_write',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'tentative',
+    },
+    20149: {
+        'name': 'DHCP-Provided IPv4 Address (Candidate)',
+        'type': 'IPV4',
+        'words': 2,
+        'scale': 1,
+        'unit': '',
+        'write_status': 'unverified_do_not_write',
+        'source': 'forum_hypothesis_and_empirical_modbus_read',
+        'confidence': 'tentative',
+    },
     # Controlled cloud-UI observations showed 0 for Never/Off and 1 for every
     # enabled cadence (Once, Daily, 7, 15, or 30 days). The cadence itself is
     # therefore not encoded in this register.
@@ -803,6 +950,10 @@ def _decode_known(meta: dict[str, object], words: Sequence[int]) -> str:
     if register_type == "STR":
         raw_bytes = b"".join(word.to_bytes(2, "big") for word in words)
         return raw_bytes.decode("ascii", errors="ignore").rstrip("\x00 ")
+
+    if register_type == "IPV4":
+        raw_bytes = b"".join(word.to_bytes(2, "big") for word in words)
+        return ".".join(str(octet) for octet in raw_bytes)
 
     if register_type == "WORDS":
         raw_bytes = b"".join(word.to_bytes(2, "big") for word in words)
