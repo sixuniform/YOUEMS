@@ -3408,18 +3408,24 @@ template:
         unit_of_measurement: "%"
         icon: mdi:solar-panel
         state: >
-          {% set enabled = is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on') %}
           {% set samples = states('input_number.youems_pv_availability_samples') | int(0) %}
           {% set learned_raw = states('input_number.youems_pv_availability_learned_pct') %}
           {% set learned = learned_raw | float(100) if samples > 0 and is_number(learned_raw) else 100 %}
-          {{ ([[learned if enabled else 100, 0] | max, 100] | min) | round(1) }}
+          {{ ([[learned, 0] | max, 100] | min) | round(1) }}
         attributes:
           enabled: "{{ is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on') }}"
           learned_factor_pct: >
             {% set samples = states('input_number.youems_pv_availability_samples') | int(0) %}
             {% set learned_raw = states('input_number.youems_pv_availability_learned_pct') %}
             {{ ([[learned_raw | float(100) if samples > 0 and is_number(learned_raw) else 100, 0] | max, 100] | min) | round(1) }}
-          effective_factor_pct: "{{ states('sensor.youems_pv_availability') | float(100) | round(1) }}"
+          applied_factor_pct: >
+            {{ (states('sensor.youems_pv_availability') | float(100) | round(1))
+               if is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on')
+               else 100.0 }}
+          effective_factor_pct: >
+            {{ (states('sensor.youems_pv_availability') | float(100) | round(1))
+               if is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on')
+               else 100.0 }}
           accepted_updates: "{{ states('input_number.youems_pv_availability_samples') | int(0) }}"
           shortfall_response_pct: "{{ states('input_number.youems_pv_shortfall_response_pct') | float(50) | round(0) }}"
           recovery_response_pct: "{{ states('input_number.youems_pv_recovery_response_pct') | float(40) | round(0) }}"
@@ -3427,6 +3433,9 @@ template:
           last_update: "{{ states('input_text.youems_pv_availability_last_update') }}"
           learning_window: "completed Solcast 30-minute periods"
           minimum_p50_energy_kwh: 0.25
+          full_learning_weight_p50_kwh: 3.0
+          energy_weight_rule: "learning response is scaled by expected P50 energy / 3.0 kWh, capped at 100%"
+          application_rule: "learning always runs; PV Forecast Adaptation controls whether the learned factor is applied to planning"
           downward_gate: "actual energy below Solcast P10 energy"
           observation_deadband_pct_points: 2
           curtailment_guard: "skip whole period if PV PLim, or EMS CmdLim while 50208 is restrictive"
@@ -3442,7 +3451,7 @@ template:
           {% set samples = states('input_number.youems_pv_availability_samples') | int(0) %}
           {% set factor = states('sensor.youems_pv_availability') | float(100) %}
           {% if not enabled %}
-            Disabled — trusting Solcast
+            Disabled — tracking {{ factor | round(0) | int }}%, planner uses 100%
           {% elif samples <= 0 %}
             Learning — trusting Solcast
           {% elif factor >= 90 %}
@@ -3455,8 +3464,9 @@ template:
             Severely restricted
           {% endif %}
         attributes:
-          effective_factor_pct: "{{ states('sensor.youems_pv_availability') | float(100) | round(1) }}"
-          learned_factor_pct: "{{ state_attr('sensor.youems_pv_availability', 'learned_factor_pct') }}"
+          effective_factor_pct: "{{ state_attr('sensor.youems_pv_availability', 'effective_factor_pct') }}"
+          learned_factor_pct: "{{ states('sensor.youems_pv_availability') | float(100) | round(1) }}"
+          application_enabled: "{{ is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on') }}"
           last_update: "{{ states('input_text.youems_pv_availability_last_update') }}"
 
       - name: "YOUEMS Shadow Battery Remaining Capacity"
@@ -4341,7 +4351,7 @@ template:
 
       - name: "YOUEMS Schedule Version"
         icon: mdi:tag-check
-        state: "2026.08.25.11.14"
+        state: "2026.08.25.16.31"
 
       - name: "Solar Excess Raw"
         unique_id: solar_excess_raw
@@ -7038,19 +7048,15 @@ automation:
   - id: youems_pv_availability_snapshot_sync
     alias: "YOUEMS - PV Availability Snapshot Sync"
     description: >
-      Re-bases the 30-minute energy snapshot after Home Assistant startup or when
-      PV Forecast Adaptation is enabled, preventing partial-window learning.
+      Re-bases the 30-minute energy snapshot after Home Assistant startup. PV learning
+      runs continuously regardless of whether the learned factor is currently applied.
     triggers:
       - trigger: homeassistant
         event: start
         id: startup
-      - trigger: state
-        entity_id: input_boolean.youems_pv_forecast_adaptation_enabled
-        to: "on"
-        id: enabled
     actions:
       - delay:
-          seconds: "{{ 20 if trigger.id == 'startup' else 2 }}"
+          seconds: 20
       - variables:
           energy_valid: "{{ is_number(states('sensor.youems_pv_learning_energy')) }}"
           energy_now: "{{ states('sensor.youems_pv_learning_energy') | float(0) }}"
@@ -7092,8 +7098,11 @@ automation:
     description: |
       At each completed Solcast 30-minute period, compare integrated actual PV energy
       against raw Solcast P50/P10. Downward learning requires actual energy below P10.
-      Recovery uses actual/P50. A whole period is rejected if PV PLim occurred, or if
-      EMS CmdLim occurred while 50208 was restrictive.
+      Recovery uses actual/P50. Learning response is weighted by total expected P50
+      energy so low-energy sunrise/sunset deviations have little influence while large
+      daytime shortfalls remain important. Learning runs even when PV Forecast Adaptation
+      is disabled; the toggle controls planner application only. A whole period is
+      rejected if PV PLim occurred, or if EMS CmdLim occurred while 50208 was restrictive.
     triggers:
       - trigger: time_pattern
         minutes: "0"
@@ -7164,14 +7173,19 @@ automation:
             {{ ([[actual_kwh | float(0) / expected_p50_kwh | float(1) * 100, 0] | max, 100] | min)
                if expected_p50_kwh | float(0) > 0 else 0 }}
           eligible: >
-            {{ is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on')
-               and not is_state('input_boolean.youems_inverter_communication_fault', 'on')
+            {{ not is_state('input_boolean.youems_inverter_communication_fault', 'on')
                and energy_now_valid
                and continuity_valid
                and flags_valid
                and not period_curtailed
                and expected_p50_kwh | float(0) >= 0.25 }}
       - variables:
+          learning_energy_weight: >
+            {{ [[expected_p50_kwh | float(0) / 3.0, 0] | max, 1] | min }}
+          effective_shortfall_response: >
+            {{ shortfall_response | float(0.50) * learning_energy_weight | float(0) }}
+          effective_recovery_response: >
+            {{ recovery_response | float(0.40) * learning_energy_weight | float(0) }}
           update_direction: >
             {% if eligible
                   and observed_pct | float(0) < current_factor_pct | float(100) - 2
@@ -7187,16 +7201,14 @@ automation:
             {% set old = current_factor_pct | float(100) %}
             {% set obs = observed_pct | float(old) %}
             {% if update_direction == 'shortfall' %}
-              {{ (old + shortfall_response | float(0.50) * (obs - old)) | round(1) }}
+              {{ (old + effective_shortfall_response | float(0) * (obs - old)) | round(1) }}
             {% elif update_direction == 'recovery' %}
-              {{ (old + recovery_response | float(0.40) * (obs - old)) | round(1) }}
+              {{ (old + effective_recovery_response | float(0) * (obs - old)) | round(1) }}
             {% else %}
               {{ old | round(1) }}
             {% endif %}
           skip_reason: >
-            {% if not is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on') %}
-              disabled
-            {% elif is_state('input_boolean.youems_inverter_communication_fault', 'on') %}
+            {% if is_state('input_boolean.youems_inverter_communication_fault', 'on') %}
               inverter communication fault
             {% elif not energy_now_valid %}
               PV energy unavailable
@@ -7246,7 +7258,10 @@ automation:
                 {{ current_factor_pct | float(100) | round(1) }}→{{ new_factor_pct | float(100) | round(1) }}%;
                 actual {{ actual_kwh | float(0) | round(3) }} kWh /
                 P50 {{ expected_p50_kwh | float(0) | round(3) }} /
-                P10 {{ expected_p10_kwh | float(0) | round(3) }}
+                P10 {{ expected_p10_kwh | float(0) | round(3) }};
+                weight {{ (learning_energy_weight | float(0) * 100) | round(0) }}%,
+                response {{ ((effective_shortfall_response if update_direction == 'shortfall'
+                              else effective_recovery_response) | float(0) * 100) | round(1) }}%
         else:
           - action: input_text.set_value
             target:
@@ -7256,7 +7271,8 @@ automation:
                 {{ now().strftime('%Y-%m-%d %H:%M:%S') }} HOLD — {{ skip_reason | trim }};
                 actual {{ actual_kwh | float(0) | round(3) }} kWh /
                 P50 {{ expected_p50_kwh | float(0) | round(3) }} /
-                P10 {{ expected_p10_kwh | float(0) | round(3) }}
+                P10 {{ expected_p10_kwh | float(0) | round(3) }};
+                weight {{ (learning_energy_weight | float(0) * 100) | round(0) }}%
       - if:
           - condition: template
             value_template: "{{ energy_now_valid }}"
@@ -11896,9 +11912,12 @@ script:
                else (states('input_number.auto_inverter_forecast_bias') | float(0) / 100
                      if _use_inv_card else
                      states('input_number.auto_charge_forecast_bias') | float(0) / 100) }}
-          # Global physical array-availability correction. Off = 1.0 exactly.
+          # Global physical array-availability correction. Learning always runs;
+          # this toggle controls application only. Off = 1.0 exactly.
           pv_availability_factor: >
-            {{ [[states('sensor.youems_pv_availability') | float(100) / 100, 0] | max, 1] | min }}
+            {{ [[states('sensor.youems_pv_availability') | float(100) / 100, 0] | max, 1] | min
+               if is_state('input_boolean.youems_pv_forecast_adaptation_enabled', 'on')
+               else 1.0 }}
           sell_enabled_resolved: >
             {{ sell_enabled | default(none) | string in ['True','true','1']
                if sell_enabled | default(none) is not none

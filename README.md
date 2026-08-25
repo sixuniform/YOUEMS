@@ -17,8 +17,8 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.25.11.14`
-- Dashboard: `v2026.08.22.20.18`
+- Scheduler: `v2026.08.25.16.31`
+- Dashboard: `v2026.08.25.16.31`
 
 The tested system uses:
 
@@ -399,6 +399,34 @@ notification rendering. Two cases are now guarded:
 Optional diagnostic fields now render with safe defaults, and Sell SOC-at-solar-start
 renders `n/a` while capacity is zero. Planner economics and schedule selection are
 unchanged.
+
+
+
+### PV Availability energy weighting and tracking-only mode (2026.08.25.16.31)
+
+PV Availability learning now distinguishes a large percentage error at very low solar
+power from a materially important daytime miss.
+
+The existing 30-minute `actual/P50` observation is still used, and downward learning
+still requires actual energy below P10. The response applied to each accepted observation
+is now multiplied by:
+
+`min(expected P50 energy / 3.0 kWh, 1.0)`
+
+Examples for one 30-minute period:
+
+- 0.8 kW average P50 = 0.4 kWh -> 13% learning weight.
+- 3.0 kW average P50 = 1.5 kWh -> 50% learning weight.
+- 6.0 kW average P50 = 3.0 kWh -> 100% learning weight.
+
+This keeps sunset/tree-shadow misses from disproportionately lowering the global next-day
+PV factor while preserving a strong response to large daytime shortfalls.
+
+`PV Forecast Adaptation` is now an **application toggle only**. Learning, observations,
+and the learned `sensor.youems_pv_availability` value continue updating while the toggle
+is off. With the toggle off, planner/pSOC calculations explicitly use 100% availability.
+The dashboard keeps the learned value/status visible, and the visual `Solar adjusted`
+trace may still show the learned estimate for diagnostics.
 
 
 ## Inverter communication watchdog
