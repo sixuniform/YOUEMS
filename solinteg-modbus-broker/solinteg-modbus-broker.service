@@ -12,6 +12,7 @@ StartLimitIntervalSec=0
 Type=simple
 DynamicUser=yes
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/default/solinteg-modbus-broker
 WorkingDirectory=/opt/solinteg-modbus-broker
 ExecStart=/opt/solinteg-modbus-broker/venv/bin/python /opt/solinteg-modbus-broker/solinteg-modbus-broker.py
