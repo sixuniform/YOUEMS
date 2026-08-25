@@ -17688,9 +17688,9 @@ script:
           notify_feed_min_advantage: "{{ states('input_number.' ~ notify_feed_prefix ~ '_feed_in_min_advantage') | float(5) }}"
           notify_feed_forecast_label: "{{ '(P10+P50)/2' if is_state('input_boolean.' ~ notify_feed_prefix ~ '_feed_in_conservative_forecast', 'on') else 'P50' }}"
           notify_feed_candidate_ts: >-
-  {% set opening = notify_feed_diag.op | default(0) | int(0) %}
-  {% set safe_end = notify_feed_diag.se | default(0) | int(0) %}
-  {{ opening if opening > 0 else safe_end }}
+            {% set opening = notify_feed_diag.op | default(0) | int(0) %}
+            {% set safe_end = notify_feed_diag.se | default(0) | int(0) %}
+            {{ opening if opening > 0 else safe_end }}
           notify_feed_mode_text: >-
             {{ 'PV Charge — all PV charges battery; house imported'
                if notify_feed_diag.md | default('') == 'all_pv'
