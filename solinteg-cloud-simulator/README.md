@@ -151,7 +151,8 @@ combines the current Home Assistant Solinteg plugin with Solinteg protocol
 v00.02. Controlled empirical findings are added with explicit source and
 confidence metadata. The map covers unsigned and signed 16/32-bit values,
 scaling, units, strings, versions, packed date/time fields, enums, alarm/status
-bits, the BMS status word, and the newer Intelligent/ToU staging interface.
+bits, IPv4 values, duplicate/secondary registers, the BMS status word, and the
+newer Intelligent/ToU staging interface.
 The optional verbose logger applies those same translations directly to every
 register range carried by the cloud frame.
 
@@ -166,19 +167,22 @@ definitions. The original discussion is
 Several findings on that page are already represented in the Broker v5.12
 table: both RTC blocks, battery current limits `33021`/`33023`, and the EMS BMS
 block `53500–53523`. Direct reads from a Solinteg have since confirmed both
-endpoint strings; the other fields remain candidates:
+endpoint strings and two secondary counters. Candidate fields are retained in
+the shared map with explicit confidence metadata so they decode usefully
+without being presented as safe write targets:
 
 | Register(s) | Meaning under test | Status |
 |---:|---|---|
-| `20007–20008` | Duplicate total generation energy, possibly matching `11020–11021` | Tentative |
-| `20010` | Work-hours counter | Tentative |
+| `20007–20008` | Secondary total-generation counter matching `11020–11021` | Confirmed on one Solinteg |
+| `20010` | Secondary generation-hours counter matching `11022–11023` | Confirmed on one Solinteg |
 | `20011` | Unknown serial-format/communication setting | Speculative |
-| `20012` | Opaque communication parameter; observed as `247`, but not the Modbus TCP unit ID | Unknown |
+| `20012` | RS485 device-ID candidate; observed as `247` | Plausible, not officially confirmed |
 | `20016–20045` | Normal cloud endpoint ASCII field | Confirmed on Solinteg |
 | `20046–20075` | Technical endpoint ASCII field | Confirmed on Solinteg |
 | `20076–20087` | Opaque service values | Unknown |
-| `20088–20099` | Three credential-like ASCII fields | Tentative |
-| `20100–20139` | Unknown network/service block; all zero on one reported firmware | Unknown |
+| `20088–20099` | Three four-word ASCII credentials; individual purposes unknown | Confirmed format, unknown purpose |
+| `20100–20102` | Six-byte service identifier; meaning unknown | Confirmed format, unknown purpose |
+| `20103–20139` | Unknown network/service block | Unknown |
 | `20140` | Network-mode candidate | Tentative |
 | `20141–20142` | Static/non-DHCP IPv4 address candidate | Tentative |
 | `20143–20144` | Gateway candidate | Tentative |
@@ -201,10 +205,16 @@ python3 probe-undocumented-registers.py \
 ```
 
 For this interface the correct Modbus TCP unit ID is `255`. Although register
-`20012` has been observed with value `247`, reads addressed to unit `255` work
-and the Broker passes that unit unchanged to the inverter. Register `20012`
-must therefore not be used as evidence that Modbus TCP clients should address
-unit `247`; its actual purpose remains unknown.
+`20012` has been observed with value `247`, which is also reported online as
+the RS485 unit ID. That interpretation is plausible but has not been confirmed
+in official Solinteg material. Reads through the Ethernet communications
+module must use unit `255`; the Broker passes that unit unchanged to the
+inverter. Do not use `247` for Modbus TCP.
+
+The IPv4 fields use two big-endian words, one byte per address octet. Their
+observed static address did not match the inverter's active DHCP address, so
+they may describe dormant fallback settings. Every network-field entry is
+marked `unverified_do_not_write` in the shared map.
 
 The raw word dump is followed by tentative interpretations and comparisons.
 The three credential-like fields are represented only by length and a short
