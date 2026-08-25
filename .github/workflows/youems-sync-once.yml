@@ -1,0 +1,31 @@
+name: YOUEMS one-shot canonical sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/youems-sync-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply YOUEMS v2026.08.25.16.31
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply .sync/sched.patch
+          git apply .sync/dash.patch
+          git apply .sync/readme.patch
+          grep -q '2026.08.25.16.31' solinteg_schedule.yaml
+          rm -rf .sync
+          rm -f .github/workflows/youems-sync-once.yml
+          git config user.name 'YOUEMS sync'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git commit -m 'PV availability energy-weighted learning'
+          git push
