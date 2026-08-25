@@ -13,8 +13,8 @@ It can optionally mirror a copy of each acknowledged inverter frame to the
 matching real hostname through a SOCKS5 proxy. This forwarding path is
 deliberately one-way by default: bytes received from either server are logged
 and ignored. A separate, explicit test switch can temporarily forward normal
-cloud commands while their real inverter responses are being reverse
-engineered. Another explicit mode keeps `01:10` writes blocked but returns a
+cloud commands while the corresponding inverter responses are inspected and
+compared. Another explicit mode keeps `01:10` writes blocked but returns a
 locally generated success acknowledgement to the cloud. These command modes
 apply only to the normal cloud endpoint; technical-server input is always
 ignored.
@@ -26,7 +26,7 @@ communication module and, indirectly, delaying local Modbus TCP traffic.
 Cloud mirroring is disabled by default. The simulator never deliberately
 delays local replies. It saves no complete payloads unless the optional
 unknown-frame logger is enabled or SOCKS5 mirroring is enabled, in which case
-all ignored cloud input is saved for reverse engineering.
+all ignored cloud input is saved for protocol analysis.
 
 ## Why this exists
 
@@ -37,10 +37,10 @@ rejecting the cloud connection made the problem much worse—at one point about
 95% of Modbus requests failed.
 
 Proxying the cloud connection through a working Internet path removed the
-Modbus delays. Captures of that connection then showed that the server's reply
-is a small deterministic acknowledgement. This program generates that reply
-locally, so the communication module sees a successful cloud transaction
-without any Internet dependency.
+Modbus delays. Observed traffic showed that the server's reply is a small
+deterministic acknowledgement. This program generates that reply locally, so
+the communication module sees a successful cloud transaction without any
+Internet dependency.
 
 When cloud visibility is wanted, the optional mirror preserves that immediate
 local reply while sending telemetry independently. A slow or unavailable
@@ -87,20 +87,20 @@ The cloud destination remains on local port `5743`; the technical destination
 is redirected to local port `5744`. No general cloud subnet block or redirect
 is installed.
 
-## Protocol findings
+## Protocol behavior
 
-The following was derived from packet captures of one installation. Captured
-identifiers, manufacturers, and live measurements are intentionally omitted
-from this document.
+The following describes traffic observed on one installation. Identifiers,
+manufacturers, and live measurements are intentionally omitted from this
+document.
 
 - Telemetry uses unencrypted TCP on port 5743.
 - Client frames start with `ST`.
 - Bytes 2–5 contain a big-endian length equal to total frame length minus 9.
 - The final two bytes are CRC-16/Modbus in little-endian wire order.
 - The real server returns a deterministic 58-byte acknowledgement.
-- Captured request types were `01:03`, `01:04`, and `01:44`.
-- Captured cloud write commands use type `01:10`.
-- The generated replies matched all 17 captured genuine server replies exactly.
+- Observed request types were `01:03`, `01:04`, and `01:44`.
+- Observed cloud write commands use type `01:10`.
+- The generated replies matched all 17 recorded server replies exactly.
 - Reply generation took approximately 0.077 ms during development testing.
 
 ### Register snapshots inside the cloud frames
@@ -138,40 +138,41 @@ The frame timestamp at bytes 26–31 records transmission time. The second
 timestamp at bytes 42–47 records when the register snapshot was taken. They
 normally match for current data but differ for buffered historical data.
 
-Across the captured packet families, 907 distinct register addresses were
+Across the observed packet families, 907 distinct register addresses were
 present. The current Solinteg plugin can decode 91 named entities from those
 ranges, including device information, electrical measurements, energy
 counters, battery state, limits, temperatures, and diagnostic fields. No
-captured identifier, manufacturer string, or measurement is required to
+live identifier, manufacturer string, or measurement is required to
 describe or reproduce the packet structure.
 
 The simulator and Modbus Broker share the canonical translation metadata in
 `solinteg_modbus_map.py`. Its starting table came from Modbus Broker v5.12 and
 combines the current Home Assistant Solinteg plugin with Solinteg protocol
-v00.02. Controlled empirical findings are added with explicit source and
-confidence metadata. The map covers unsigned and signed 16/32-bit values,
+v00.02. Additional validated observations are included with explicit source
+and confidence metadata. The map covers unsigned and signed 16/32-bit values,
 scaling, units, strings, versions, packed date/time fields, enums, alarm/status
 bits, IPv4 values, duplicate/secondary registers, the BMS status word, and the
 newer Intelligent/ToU staging interface.
 The optional verbose logger applies those same translations directly to every
 register range carried by the cloud frame.
 
-### Read-only probe for tentative service/network registers
+### Additional service and network registers
 
-A third-party M-TEC Energy Butler investigation reported several otherwise
-undocumented fields in the same register family used by Solinteg. These are
-controlled observations from another branded inverter, not official Solinteg
-definitions. The original discussion is
+An M-TEC Energy Butler forum discussion describes several additional fields in
+the same register family used by Solinteg. Those descriptions were compared
+with read-only values from a Solinteg inverter. They are not official Solinteg
+definitions, so uncertain entries retain explicit confidence labels. The
+original discussion is
 [Photovoltaikforum page 63](https://www.photovoltaikforum.com/thread/206243-erfahrungen-mit-m-tec-energy-butler-hybrid-wechselrichter/?pageNo=63).
 
-Several findings on that page are already represented in the Broker v5.12
+Several entries from that discussion are already represented in the Broker v5.12
 table: both RTC blocks, battery current limits `33021`/`33023`, and the EMS BMS
 block `53500–53523`. Direct reads from a Solinteg have since confirmed both
 endpoint strings and two secondary counters. Candidate fields are retained in
 the shared map with explicit confidence metadata so they decode usefully
 without being presented as safe write targets:
 
-| Register(s) | Meaning under test | Status |
+| Register(s) | Mapped meaning | Status |
 |---:|---|---|
 | `20007–20008` | Secondary total-generation counter matching `11020–11021` | Confirmed on one Solinteg |
 | `20010` | Secondary generation-hours counter matching `11022–11023` | Confirmed on one Solinteg |
@@ -190,38 +191,17 @@ without being presented as safe write targets:
 | `20147–20148` | DNS-server candidate | Tentative |
 | `20149–20150` | DHCP-provided IPv4 address candidate | Tentative |
 
-`probe-undocumented-registers.py` reads those blocks and known RTC,
-generation-energy, and generation-hours references for comparison. It uses
-only `read_holding_registers`; there are no Modbus write calls in the program.
-Multiword fields remain in one request because some Solinteg firmware rejects
-partial reads of packed values.
-
-Run it against the local Modbus Broker:
-
-```bash
-python3 probe-undocumented-registers.py \
-  --host 127.0.0.1 --port 502 --slave 255 \
-  2>&1 | tee /tmp/solinteg-undocumented-registers.log
-```
-
-For this interface the correct Modbus TCP unit ID is `255`. Although register
-`20012` has been observed with value `247`, which is also reported online as
-the RS485 unit ID. That interpretation is plausible but has not been confirmed
-in official Solinteg material. Reads through the Ethernet communications
-module must use unit `255`; the Broker passes that unit unchanged to the
-inverter. Do not use `247` for Modbus TCP.
+For this interface the correct Modbus TCP unit ID is `255`. Register `20012`
+has been observed with value `247`, which is also reported online as the RS485
+unit ID. That interpretation is plausible but has not been confirmed in
+official Solinteg material. Reads through the Ethernet communications module
+must use unit `255`; the Broker passes that unit unchanged to the inverter. Do
+not use `247` for Modbus TCP.
 
 The IPv4 fields use two big-endian words, one byte per address octet. Their
 observed static address did not match the inverter's active DHCP address, so
 they may describe dormant fallback settings. Every network-field entry is
 marked `unverified_do_not_write` in the shared map.
-
-The raw word dump is followed by tentative interpretations and comparisons.
-The three credential-like fields are represented only by length and a short
-SHA-256 prefix unless `--show-sensitive` is deliberately supplied. Do not use
-that option in logs intended for sharing. The probe should be run once under
-normal operating conditions; it is not intended as an additional continuous
-poller.
 
 ### Known request types
 
@@ -232,7 +212,7 @@ poller.
 | `01:44` | 594 bytes | 8 | 249 | Buffered historical telemetry snapshot |
 
 The 249 addresses in `01:44` are an exact subset of the `01:04` addresses. In
-the capture, a successful reconnection was followed by a burst of `01:44`
+recorded traffic, a successful reconnection was followed by a burst of `01:44`
 frames whose snapshot timestamps advanced in five-minute steps and ended near
 the current time. This is strong evidence that the communication module uses
 `01:44` to backfill measurements accumulated while cloud communication was
@@ -281,17 +261,17 @@ inverter:
 | `53070` | Intelligent/ToU Today or Tomorrow schedule commit strobe |
 | `53071–53084` | One complete Intelligent/ToU schedule-slot staging record |
 
-The captured clock command encoded the exact local date and time in three
+The observed clock command encoded the exact local date and time in three
 packed registers. Controlled working-mode, restart, and import-limit changes
 then matched the existing Broker v5.12 register names, enum values, and scale
 exactly. An identical mode command was observed more than once, consistent
 with the cloud retrying when its command received no inverter acknowledgement.
 
-Registers `50016`, `50017`, `50018`, and `50022` were discovered later by
+Registers `50016`, `50017`, `50018`, and `50022` were identified by
 correlating controlled Peak Shaving changes in the cloud UI with decoded
 `01:10` writes. They are absent from Solinteg register table v00.03 and the
 current upstream Solinteg Home Assistant plugin. The simulator therefore marks
-them as empirically discovered `RW` candidates: cloud writability is proven,
+them as observed `RW` candidates: cloud writability is proven,
 while direct writes through the inverter's public Modbus interface should be
 verified cautiously on each firmware version.
 
@@ -302,18 +282,18 @@ encoded in that register and remains unresolved.
 
 ### Intelligent/ToU schedule writing through Modbus
 
-A complete controlled upload exposed the previously undocumented
-Intelligent/ToU schedule staging interface at `53070–53084`: separate Today
+A complete controlled upload identified the additional Intelligent/ToU
+schedule staging interface at `53070–53084`: separate Today
 and Tomorrow banks, 24 slot records per day, packed start/stop times, per-slot
 operating modes, power and SOC fields, and a bank commit strobe. All 51 writes
-in the captured transaction received genuine success responses from the
+in the recorded transaction received genuine success responses from the
 inverter.
 
 The full register map, confirmed and inferred mode values, exact write order,
 readback limitations, and a dry-run-first `pymodbus` example are documented in
 **[Writing Solinteg Intelligent/ToU schedules through Modbus](SOLINTEG_TOU_MODBUS.md)**.
 
-The controlled writes also captured their genuine inverter acknowledgements.
+The controlled writes also provided genuine inverter acknowledgements.
 Single-register requests were 58 bytes, while a seven-register TOU request was
 74 bytes. The success reply is fixed at 58 bytes in both cases: it preserves
 the target range but replaces all request values with one status byte and
@@ -329,7 +309,7 @@ padding. It has this exact layout:
 | 45 | 11 bytes | `FF` padding |
 | 56 | 2 bytes | Recalculated CRC-16/Modbus, low byte first |
 
-This transformation reproduced the captured genuine single-register inverter
+This transformation reproduced the recorded genuine single-register inverter
 replies exactly and is also used for variable-length multi-register requests.
 The command timestamp itself is not echoed: the inverter used its current
 timestamp. The simulator therefore caches the timestamp from the latest
@@ -337,7 +317,7 @@ outgoing telemetry frame, advances it using monotonic elapsed time, and uses
 the local clock only before a valid device timestamp has been observed. Reusing
 the cached timestamp unchanged did not complete the first cloud-UI test.
 
-A later full-communication capture showed that the `01:10` reply is only one
+A later end-to-end communication test showed that the `01:10` reply is only one
 part of cloud-side command confirmation. After applying a write, the genuine
 inverter sent this sequence:
 
@@ -363,8 +343,8 @@ communication module gather or process hundreds of inverter registers over
 the same internal communication path used by local Modbus. That mechanism is
 consistent with the observed local Modbus stalls and with DROP, REJECT, or an
 acknowledgement-free TCP sink making the problem substantially worse. This is
-an evidence-based explanation, but the module's internal scheduling remains
-undocumented.
+an evidence-based explanation, but the module's internal scheduling is not
+directly observable.
 
 Valid frames of previously unseen types are logged and acknowledged by
 default. Frames with an invalid length or CRC are logged and are never
@@ -510,7 +490,7 @@ intended for protocol inspection, not routine operation.
 This saves only valid frames whose two-byte message type has not previously
 been identified. Known `01:03`, `01:04`, and `01:44` frames are never written
 by this option. Each unknown frame becomes one JSON Lines record containing
-capture time, endpoint label (`cloud` or `tech`), peer, type, length, SHA-256,
+recording time, endpoint label (`cloud` or `tech`), peer, type, length, SHA-256,
 and the complete frame encoded as base64. The default file is:
 
 ```text
@@ -518,7 +498,7 @@ and the complete frame encoded as base64. The default file is:
 ```
 
 The systemd unit creates that directory with mode `0700`; files are created
-with mode `0600`. To reconstruct the newest saved frame:
+with mode `0600`. To extract the newest saved frame:
 
 ```bash
 sudo tail -n 1 \
@@ -620,7 +600,7 @@ acknowledgements queued for the cloud, commands queued for the inverter,
 invalid input, and routing failures. The paths can be changed with
 `--cloud-incoming-log PATH` and `--tech-incoming-log PATH`.
 
-To reconstruct the newest cloud frame:
+To extract the newest cloud frame:
 
 ```bash
 sudo tail -n 1 \
@@ -821,9 +801,9 @@ removed automatically.
 
 ## Limits and safety
 
-This is experimental, independently developed software based on captures from
-one Solinteg hybrid-inverter installation. Other models, firmware versions,
-regions, or future cloud protocol revisions may behave differently.
+This is an independently developed compatibility tool validated against
+traffic from one Solinteg hybrid-inverter installation. Other models, firmware
+versions, regions, or future cloud protocol revisions may behave differently.
 
 With SOCKS5 mirroring disabled, redirecting either endpoint disables delivery
 of its intercepted traffic to the vendor. With mirroring enabled, inverter
