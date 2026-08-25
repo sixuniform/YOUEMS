@@ -41,9 +41,10 @@ fi
 # Keep one canonical registry map in Git. In a full YOUEMS clone the broker
 # directory contains a symlink to the simulator's canonical map, so use it.
 # For a stand-alone broker download, fetch that same canonical source directly.
-if [[ -f "$source_directory/solinteg_modbus_map.py" ]]; then
-    install -m 0644 "$(readlink -f "$source_directory/solinteg_modbus_map.py")" "$map_file"
-    echo "Installed canonical register map from the YOUEMS checkout."
+source_map="$source_directory/solinteg_modbus_map.py"
+if [[ -f "$source_map" ]] && grep -q '^REGISTER_METADATA = {' "$source_map"; then
+    install -m 0644 "$(readlink -f "$source_map")" "$map_file"
+    echo "Installed canonical register map from the YOUEMS checkout/local file."
 elif command -v curl >/dev/null 2>&1; then
     curl -fsSL "$map_url" -o "$map_file"
     chmod 0644 "$map_file"
