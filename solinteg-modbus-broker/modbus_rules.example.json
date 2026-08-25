@@ -1,0 +1,24 @@
+{
+  "FORBIDDEN_REGISTERS": [
+    50000,
+    50208
+  ],
+  "WRITE_CONVERSIONS": {
+    "52503": {
+      "100": 50
+    },
+    "50210": {
+      "2": 1
+    }
+  },
+  "READ_OVERRIDES": {
+    "50208": {
+      "value": 0,
+      "target": "RW"
+    },
+    "11028": {
+      "value": 1234,
+      "target": "BOTH"
+    }
+  }
+}
