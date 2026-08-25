@@ -4341,7 +4341,7 @@ template:
 
       - name: "YOUEMS Schedule Version"
         icon: mdi:tag-check
-        state: "2026.08.23.20.01"
+        state: "2026.08.25.11.14"
 
       - name: "Solar Excess Raw"
         unique_id: solar_excess_raw
@@ -17687,7 +17687,10 @@ script:
           notify_feed_overcharge_pct: "{{ states('input_number.' ~ notify_feed_prefix ~ '_overcharge_pct') | float(0) }}"
           notify_feed_min_advantage: "{{ states('input_number.' ~ notify_feed_prefix ~ '_feed_in_min_advantage') | float(5) }}"
           notify_feed_forecast_label: "{{ '(P10+P50)/2' if is_state('input_boolean.' ~ notify_feed_prefix ~ '_feed_in_conservative_forecast', 'on') else 'P50' }}"
-          notify_feed_candidate_ts: "{{ notify_feed_diag.op | int(0) if notify_feed_diag.op | int(0) > 0 else notify_feed_diag.se | int(0) }}"
+          notify_feed_candidate_ts: >-
+  {% set opening = notify_feed_diag.op | default(0) | int(0) %}
+  {% set safe_end = notify_feed_diag.se | default(0) | int(0) %}
+  {{ opening if opening > 0 else safe_end }}
           notify_feed_mode_text: >-
             {{ 'PV Charge — all PV charges battery; house imported'
                if notify_feed_diag.md | default('') == 'all_pv'
@@ -17758,46 +17761,46 @@ script:
             Selected Self-Consumption: {{ notify_self_consumption_slots }} slots = {{ (notify_self_consumption_slots | int * 0.25) | round(2) }}h
           notify_sell_1_text: |-
             ═══ SELL SCHEDULE ═══
-            {% if sell_enabled_resolved and notify_sell_diag | length > 0 %}Forecast {{ notify_sell_forecast_label }}: today {{ notify_sell_diag.td | float(0) | round(1) }} kWh | tomorrow {{ notify_sell_diag.tm | float(0) | round(1) }} kWh
+            {% if sell_enabled_resolved and notify_sell_diag | length > 0 %}Forecast {{ notify_sell_forecast_label }}: today {{ notify_sell_diag.td | default(0) | float(0) | round(1) }} kWh | tomorrow {{ notify_sell_diag.tm | default(0) | float(0) | round(1) }} kWh
             SOC next boundary: {{ notify_soc_kwh | float(0) | round(1) }} kWh | Buffer: {{ sell_soc_buffer_pct_resolved | round(0) | int }}% = {{ (notify_cap | float(0) * sell_soc_buffer_pct_resolved / 100) | round(1) }} kWh
-            Solar self-sustain: {{ notify_sell_diag.bs | int(0) | timestamp_custom('%H:%M', true) if notify_sell_diag.bs | int(0) > 0 else 'none' }}{% else %}Sell disabled or no validated cycle{% endif %}
+            Solar self-sustain: {{ notify_sell_diag.bs | default(0) | int(0) | timestamp_custom('%H:%M', true) if notify_sell_diag.bs | default(0) | int(0) > 0 else 'none' }}{% else %}Sell disabled or no validated cycle{% endif %}
           notify_sell_2_text: |-
-            {% if sell_enabled_resolved and notify_sell_diag | length > 0 %}Forecast recharge: {{ notify_sell_diag.sk | float(0) | round(1) }} kWh | Reaches 100%: {{ 'YES ✓' if notify_sell_diag.cr | int(0) else 'NO' }}
-            Baseline full: {{ notify_sell_diag.ft | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_sell_diag.cr | int(0) else 'not reached' }} | With sale: {{ notify_sell_diag.rf | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_sell_diag.rf | int(0) > 0 else 'not reached' }}
-            Refill horizon: {{ notify_sell_diag.dl | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_sell_diag.dl | int(0) > 0 else 'none' }}
-            SOC at solar start: {{ ((notify_sell_diag.ss | float(0)) / (notify_cap | float(1)) * 100) | round(0) | int }}% = {{ notify_sell_diag.ss | float(0) | round(1) }} kWh
-            Budget: {{ notify_sell_diag.bu | float(0) | round(1) }} kWh auto remaining | Manual Sell reserved {{ notify_sell_diag.mr | float(0) | round(2) }} kWh ({{ notify_sell_diag.ms | int(0) }} slots) | Gross {{ notify_sell_diag.gb | float(0) | round(1) }} kWh
+            {% if sell_enabled_resolved and notify_sell_diag | length > 0 %}Forecast recharge: {{ notify_sell_diag.sk | default(0) | float(0) | round(1) }} kWh | Reaches 100%: {{ 'YES ✓' if notify_sell_diag.cr | default(0) | int(0) else 'NO' }}
+            Baseline full: {{ notify_sell_diag.ft | default(0) | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_sell_diag.cr | default(0) | int(0) else 'not reached' }} | With sale: {{ notify_sell_diag.rf | default(0) | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_sell_diag.rf | default(0) | int(0) > 0 else 'not reached' }}
+            Refill horizon: {{ notify_sell_diag.dl | default(0) | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_sell_diag.dl | default(0) | int(0) > 0 else 'none' }}
+            SOC at solar start: {{ ((((notify_sell_diag.ss | default(0) | float(0)) / (notify_cap | float(0))) * 100) | round(0) | int) if notify_cap | float(0) > 0 else 'n/a' }}% = {{ notify_sell_diag.ss | default(0) | float(0) | round(1) }} kWh
+            Budget: {{ notify_sell_diag.bu | default(0) | float(0) | round(1) }} kWh auto remaining | Manual Sell reserved {{ notify_sell_diag.mr | default(0) | float(0) | round(2) }} kWh ({{ notify_sell_diag.ms | default(0) | int(0) }} slots) | Gross {{ notify_sell_diag.gb | default(0) | float(0) | round(1) }} kWh
             Selected: {{ notify_sell_blocks | length }} blocks, {{ notify_sell_total_kwh | float(0) | round(2) }} kWh{% endif %}
           notify_sell_3_text: |-
             {% if sell_enabled_resolved %}Limits: {{ sell_min_power_kw_resolved }}–{{ sell_power_kw_resolved }} kW | ≥{{ sell_min_price_resolved }} Öre | P50 PV surplus ≤{{ sell_solar_surplus_limit_kw_resolved }} kW
-            {% if sell_late_tolerance_resolved | float(0) > 0 %}Late sell: ≤{{ sell_late_tolerance_resolved | round(0) | int }} Öre/kWh from original cycle price | shifted {{ notify_sell_late.sc | int(0) }} slot{{ '' if notify_sell_late.sc | int(0) == 1 else 's' }}{% if notify_sell_late.fc | int(0) > 0 %} | anchor-replanned {{ notify_sell_late.fc | int(0) }}{% endif %}{% if notify_sell_late.uc | int(0) > 0 %} | no valid slot {{ notify_sell_late.uc | int(0) }}{% endif %}{% if notify_sell_late.ls | float(0) > 0 %} | cycle value cost {{ notify_sell_late.ls | float(0) | round(2) }} SEK{% endif %}{% else %}Late sell: off — normal highest-price plan, latest exact-price ties{% endif %}
+            {% if sell_late_tolerance_resolved | float(0) > 0 %}Late sell: ≤{{ sell_late_tolerance_resolved | round(0) | int }} Öre/kWh from original cycle price | shifted {{ notify_sell_late.sc | default(0) | int(0) }} slot{{ '' if notify_sell_late.sc | default(0) | int(0) == 1 else 's' }}{% if notify_sell_late.fc | default(0) | int(0) > 0 %} | anchor-replanned {{ notify_sell_late.fc | default(0) | int(0) }}{% endif %}{% if notify_sell_late.uc | default(0) | int(0) > 0 %} | no valid slot {{ notify_sell_late.uc | default(0) | int(0) }}{% endif %}{% if notify_sell_late.ls | default(0) | float(0) > 0 %} | cycle value cost {{ notify_sell_late.ls | default(0) | float(0) | round(2) }} SEK{% endif %}{% else %}Late sell: off — normal highest-price plan, latest exact-price ties{% endif %}
             Partial guard: power > 2×P50 PV surplus + house load{% endif %}
           notify_sell_4_text: |-
-            {% if notify_sell_late.fc | int(0) > 0 %}Anchor miss replanned: {{ notify_sell_late.fi | int(0) | timestamp_custom('%m-%d %H:%M', true) }} @ {{ notify_sell_late.fa | float(0) | round(1) }} Öre → {{ notify_sell_late.fr | int(0) | timestamp_custom('%m-%d %H:%M', true) }} @ {{ notify_sell_late.fp | float(0) | round(1) }} Öre{% if notify_sell_sanity.rc | int(0) > 0 %}
-            {% endif %}{% endif %}{% if notify_sell_sanity.rc | int(0) > 0 %}Rejected partial {{ notify_sell_sanity.bs | int | timestamp_custom('%m-%d %H:%M', true) }}: proposed {{ notify_sell_sanity.rk | float(0) | round(1) }} kW | required >{{ notify_sell_sanity.rm | float(0) | round(1) }} kW
-            House load {{ notify_sell_sanity.rl | float(0) | round(2) }} kW | PV surplus {{ notify_sell_sanity.rs | float(0) | round(2) }} kW{% endif %}
+            {% if notify_sell_late.fc | default(0) | int(0) > 0 %}Anchor miss replanned: {{ notify_sell_late.fi | default(0) | int(0) | timestamp_custom('%m-%d %H:%M', true) }} @ {{ notify_sell_late.fa | default(0) | float(0) | round(1) }} Öre → {{ notify_sell_late.fr | default(0) | int(0) | timestamp_custom('%m-%d %H:%M', true) }} @ {{ notify_sell_late.fp | default(0) | float(0) | round(1) }} Öre{% if notify_sell_sanity.rc | default(0) | int(0) > 0 %}
+            {% endif %}{% endif %}{% if notify_sell_sanity.rc | default(0) | int(0) > 0 %}Rejected partial {{ notify_sell_sanity.bs | default(0) | int | timestamp_custom('%m-%d %H:%M', true) }}: proposed {{ notify_sell_sanity.rk | default(0) | float(0) | round(1) }} kW | required >{{ notify_sell_sanity.rm | default(0) | float(0) | round(1) }} kW
+            House load {{ notify_sell_sanity.rl | default(0) | float(0) | round(2) }} kW | PV surplus {{ notify_sell_sanity.rs | default(0) | float(0) | round(2) }} kW{% endif %}
           notify_feed_1_text: |-
             ═══ FEED-IN SCHEDULE ═══
-            {% if notify_feed_diag | length > 0 %}Candidate: {{ notify_feed_candidate_ts | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_feed_candidate_ts | int(0) > 0 else 'none' }} | Opening: {{ notify_feed_diag.op | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_feed_diag.op | int(0) > 0 else 'none' }}
+            {% if notify_feed_diag | length > 0 %}Candidate: {{ notify_feed_candidate_ts | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_feed_candidate_ts | int(0) > 0 else 'none' }} | Opening: {{ notify_feed_diag.op | default(0) | int(0) | timestamp_custom('%m-%d %H:%M', true) if notify_feed_diag.op | default(0) | int(0) > 0 else 'none' }}
             Limits: ≥{{ notify_feed_threshold | round(0) | int }} Öre | {{ notify_feed_forecast_label }} × {{ (physical_charge_factor * 100) | round(1) }}% stored + {{ notify_feed_overcharge_pct | round(0) | int }}% buffer
             Price advantage: Feed-In avg ≥ later avg + {{ notify_feed_min_advantage | float(0) | round(0) | int }} Öre/kWh | 1h rescue
             Morning: open before 12:00 | hard end 13:00{% else %}No Feed-In diagnostics{% endif %}
           notify_feed_2_text: |-
             {% if notify_feed_diag | length > 0 %}Gap mode: {{ notify_feed_mode_text }}
-            Safe through: {{ notify_feed_diag.se | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.se | int(0) > 0 else 'none' }} | Selected end: {{ notify_feed_diag.ae | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.ae | int(0) > 0 else 'none' }}
-            Recharge: {{ notify_feed_diag.br | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.br | int(0) > 0 else 'not reached' }} → {{ notify_feed_diag.fr | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.fr | int(0) > 0 else 'not reached' }}{% if notify_feed_diag.br | int(0) > 0 and notify_feed_diag.fr | int(0) > 0 %} | Delay: {{ ((notify_feed_diag.fr | int - notify_feed_diag.br | int) / 60) | round(0) | int }} min{% endif %}{% endif %}
+            Safe through: {{ notify_feed_diag.se | default(0) | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.se | default(0) | int(0) > 0 else 'none' }} | Selected end: {{ notify_feed_diag.ae | default(0) | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.ae | default(0) | int(0) > 0 else 'none' }}
+            Recharge: {{ notify_feed_diag.br | default(0) | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.br | default(0) | int(0) > 0 else 'not reached' }} → {{ notify_feed_diag.fr | default(0) | int(0) | timestamp_custom('%H:%M', true) if notify_feed_diag.fr | default(0) | int(0) > 0 else 'not reached' }}{% if notify_feed_diag.br | default(0) | int(0) > 0 and notify_feed_diag.fr | default(0) | int(0) > 0 %} | Delay: {{ ((notify_feed_diag.fr | int - notify_feed_diag.br | int) / 60) | round(0) | int }} min{% endif %}{% endif %}
           notify_feed_3_text: |-
             {% if notify_feed_diag | length > 0 %}Price comparison:
-            Feed-In avg {{ notify_feed_diag.mp | float(0) | round(1) }} Öre/kWh | Later displaced avg {{ notify_feed_diag.dp | float(0) | round(1) }} Öre/kWh
-            Advantage {{ ((notify_feed_diag.mp | float(0)) - (notify_feed_diag.dp | float(0))) | round(1) }} Öre/kWh | Required ≥{{ notify_feed_min_advantage | float(0) | round(1) }}{% endif %}
+            Feed-In avg {{ notify_feed_diag.mp | default(0) | float(0) | round(1) }} Öre/kWh | Later displaced avg {{ notify_feed_diag.dp | default(0) | float(0) | round(1) }} Öre/kWh
+            Advantage {{ ((notify_feed_diag.mp | default(0) | float(0)) - (notify_feed_diag.dp | default(0) | float(0))) | round(1) }} Öre/kWh | Required ≥{{ notify_feed_min_advantage | float(0) | round(1) }}{% endif %}
           notify_feed_4_text: |-
-            {% if notify_feed_diag | length > 0 %}Stop: {{ notify_feed_stop_text }}{% if notify_feed_diag.et | int(0) > 0 %}
-            End trim: {{ notify_feed_diag.et | int(0) }} slot{{ '' if notify_feed_diag.et | int(0) == 1 else 's' }}{% endif %}{% if notify_feed_diag.nx | int(0) > 0 %}
+            {% if notify_feed_diag | length > 0 %}Stop: {{ notify_feed_stop_text }}{% if notify_feed_diag.et | default(0) | int(0) > 0 %}
+            End trim: {{ notify_feed_diag.et | default(0) | int(0) }} slot{{ '' if notify_feed_diag.et | default(0) | int(0) == 1 else 's' }}{% endif %}{% if notify_feed_diag.nx | default(0) | int(0) > 0 %}
             First rejected extension: {{ notify_feed_diag.nx | int | timestamp_custom('%H:%M', true) }}{% endif %}{% endif %}
           notify_feed_5_text: |-
-            {% if notify_feed_diag.nx | int(0) > 0 %}Rejected price comparison:
-            Feed-In avg {{ notify_feed_diag.rmp | float(0) | round(1) }} Öre/kWh | Later displaced avg {{ notify_feed_diag.rdp | float(0) | round(1) }} Öre/kWh
-            {% if notify_feed_diag.rs | default('') == 'marginal_value' %}1h extension advantage {{ notify_feed_diag.ra | float(0) | round(1) }} Öre/kWh{% else %}Average advantage {{ ((notify_feed_diag.rmp | float(0)) - (notify_feed_diag.rdp | float(0))) | round(1) }} Öre/kWh{% endif %} | Required ≥{{ notify_feed_min_advantage | float(0) | round(1) }}{% endif %}
+            {% if notify_feed_diag.nx | default(0) | int(0) > 0 %}Rejected price comparison:
+            Feed-In avg {{ notify_feed_diag.rmp | default(0) | float(0) | round(1) }} Öre/kWh | Later displaced avg {{ notify_feed_diag.rdp | default(0) | float(0) | round(1) }} Öre/kWh
+            {% if notify_feed_diag.rs | default('') == 'marginal_value' %}1h extension advantage {{ notify_feed_diag.ra | default(0) | float(0) | round(1) }} Öre/kWh{% else %}Average advantage {{ ((notify_feed_diag.rmp | default(0) | float(0)) - (notify_feed_diag.rdp | default(0) | float(0))) | round(1) }} Öre/kWh{% endif %} | Required ≥{{ notify_feed_min_advantage | float(0) | round(1) }}{% endif %}
       - variables:
           notify_section_updates:
             - {entity: input_text.auto_plan_notify_settings, value: "{{ notify_settings_text[:255] }}"}

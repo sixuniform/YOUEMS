@@ -17,7 +17,7 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.23.20.01`
+- Scheduler: `v2026.08.25.11.14`
 - Dashboard: `v2026.08.22.20.18`
 
 The tested system uses:
@@ -385,6 +385,21 @@ The planner uses a rolling look-ahead window, normally up to 48 hours. It combin
 - Battery SOC limits and sell buffer
 - A measured time-of-day household load profile
 - Manual schedules that must not be overwritten and whose forecast battery effect is included in the planning energy budget
+
+
+### Planner reporting resilience (2026.08.25.11.14)
+
+Quarterly replans could finish the calculation/commit stage and then fail during
+notification rendering. Two cases are now guarded:
+
+- sparse Feed-In diagnostics may legitimately omit fields such as `op`;
+- a temporarily zero battery-rated-capacity value must never be used as a divisor in
+  the Sell notification.
+
+Optional diagnostic fields now render with safe defaults, and Sell SOC-at-solar-start
+renders `n/a` while capacity is zero. Planner economics and schedule selection are
+unchanged.
+
 
 ## Inverter communication watchdog
 ### Degraded-communication operating-mode policy
