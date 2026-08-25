@@ -1,0 +1,106 @@
+name: YOUEMS planner reporting fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/youems-replan-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply canonical YOUEMS updates
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('solinteg_schedule.yaml')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('state: "2026.08.23.20.01"', 'state: "2026.08.25.11.14"', 1)
+          s = s.replace(
+              '          notify_feed_candidate_ts: "{{ notify_feed_diag.op | int(0) if notify_feed_diag.op | int(0) > 0 else notify_feed_diag.se | int(0) }}"',
+              """          notify_feed_candidate_ts: >-
+            {% set opening = notify_feed_diag.op | default(0) | int(0) %}
+            {% set safe_end = notify_feed_diag.se | default(0) | int(0) %}
+            {{ opening if opening > 0 else safe_end }}""",
+              1,
+          )
+
+          start = s.index('          notify_settings_text:')
+          end = s.index('      - variables:\n          notify_section_updates:', start)
+          before, report, after = s[:start], s[start:end], s[end:]
+          repl = {
+              'notify_feed_diag.op | int(0)': 'notify_feed_diag.op | default(0) | int(0)',
+              'notify_feed_diag.se | int(0)': 'notify_feed_diag.se | default(0) | int(0)',
+              'notify_feed_diag.ae | int(0)': 'notify_feed_diag.ae | default(0) | int(0)',
+              'notify_feed_diag.br | int(0)': 'notify_feed_diag.br | default(0) | int(0)',
+              'notify_feed_diag.fr | int(0)': 'notify_feed_diag.fr | default(0) | int(0)',
+              'notify_feed_diag.mp | float(0)': 'notify_feed_diag.mp | default(0) | float(0)',
+              'notify_feed_diag.dp | float(0)': 'notify_feed_diag.dp | default(0) | float(0)',
+              'notify_feed_diag.et | int(0)': 'notify_feed_diag.et | default(0) | int(0)',
+              'notify_feed_diag.nx | int(0)': 'notify_feed_diag.nx | default(0) | int(0)',
+              'notify_feed_diag.rmp | float(0)': 'notify_feed_diag.rmp | default(0) | float(0)',
+              'notify_feed_diag.rdp | float(0)': 'notify_feed_diag.rdp | default(0) | float(0)',
+              'notify_feed_diag.ra | float(0)': 'notify_feed_diag.ra | default(0) | float(0)',
+              'notify_sell_diag.td | float(0)': 'notify_sell_diag.td | default(0) | float(0)',
+              'notify_sell_diag.tm | float(0)': 'notify_sell_diag.tm | default(0) | float(0)',
+              'notify_sell_diag.bs | int(0)': 'notify_sell_diag.bs | default(0) | int(0)',
+              'notify_sell_diag.sk | float(0)': 'notify_sell_diag.sk | default(0) | float(0)',
+              'notify_sell_diag.cr | int(0)': 'notify_sell_diag.cr | default(0) | int(0)',
+              'notify_sell_diag.ft | int(0)': 'notify_sell_diag.ft | default(0) | int(0)',
+              'notify_sell_diag.rf | int(0)': 'notify_sell_diag.rf | default(0) | int(0)',
+              'notify_sell_diag.dl | int(0)': 'notify_sell_diag.dl | default(0) | int(0)',
+              'notify_sell_diag.ss | float(0)': 'notify_sell_diag.ss | default(0) | float(0)',
+              'notify_sell_diag.bu | float(0)': 'notify_sell_diag.bu | default(0) | float(0)',
+              'notify_sell_diag.mr | float(0)': 'notify_sell_diag.mr | default(0) | float(0)',
+              'notify_sell_diag.ms | int(0)': 'notify_sell_diag.ms | default(0) | int(0)',
+              'notify_sell_diag.gb | float(0)': 'notify_sell_diag.gb | default(0) | float(0)',
+              'notify_sell_late.sc | int(0)': 'notify_sell_late.sc | default(0) | int(0)',
+              'notify_sell_late.fc | int(0)': 'notify_sell_late.fc | default(0) | int(0)',
+              'notify_sell_late.uc | int(0)': 'notify_sell_late.uc | default(0) | int(0)',
+              'notify_sell_late.ls | float(0)': 'notify_sell_late.ls | default(0) | float(0)',
+              'notify_sell_late.fi | int(0)': 'notify_sell_late.fi | default(0) | int(0)',
+              'notify_sell_late.fa | float(0)': 'notify_sell_late.fa | default(0) | float(0)',
+              'notify_sell_late.fr | int(0)': 'notify_sell_late.fr | default(0) | int(0)',
+              'notify_sell_late.fp | float(0)': 'notify_sell_late.fp | default(0) | float(0)',
+              'notify_sell_sanity.rc | int(0)': 'notify_sell_sanity.rc | default(0) | int(0)',
+              'notify_sell_sanity.rk | float(0)': 'notify_sell_sanity.rk | default(0) | float(0)',
+              'notify_sell_sanity.rm | float(0)': 'notify_sell_sanity.rm | default(0) | float(0)',
+              'notify_sell_sanity.rl | float(0)': 'notify_sell_sanity.rl | default(0) | float(0)',
+              'notify_sell_sanity.rs | float(0)': 'notify_sell_sanity.rs | default(0) | float(0)',
+          }
+          for old, new in repl.items():
+              report = report.replace(old, new)
+          report = report.replace(
+              '{{ ((notify_sell_diag.ss | default(0) | float(0)) / (notify_cap | float(1)) * 100) | round(0) | int }}%',
+              "{{ ((((notify_sell_diag.ss | default(0) | float(0)) / (notify_cap | float(0))) * 100) | round(0) | int) if notify_cap | float(0) > 0 else 'n/a' }}%",
+              1,
+          )
+          report = report.replace(
+              'notify_sell_sanity.bs | int | timestamp_custom',
+              'notify_sell_sanity.bs | default(0) | int | timestamp_custom',
+              1,
+          )
+          p.write_text(before + report + after, encoding='utf-8')
+
+          r = Path('README.md')
+          t = r.read_text(encoding='utf-8')
+          t = t.replace('- Scheduler: `v2026.08.23.20.01`', '- Scheduler: `v2026.08.25.11.14`', 1)
+          note = '''\n### Planner reporting resilience (2026.08.25.11.14)\n\nQuarterly replans could finish the calculation/commit stage and then fail during\nnotification rendering. Two cases are now guarded:\n\n- sparse Feed-In diagnostics may legitimately omit fields such as `op`;\n- a temporarily zero battery-rated-capacity value must never be used as a divisor in\n  the Sell notification.\n\nOptional diagnostic fields now render with safe defaults, and Sell SOC-at-solar-start\nrenders `n/a` while capacity is zero. Planner economics and schedule selection are\nunchanged.\n\n'''
+          if '### Planner reporting resilience (2026.08.25.11.14)' not in t:
+              marker = '## Inverter communication watchdog'
+              t = t.replace(marker, note + '\n' + marker, 1)
+          r.write_text(t, encoding='utf-8')
+          PY
+
+          git config user.name 'YOUEMS sync'
+          git config user.email 'actions@users.noreply.github.com'
+          git add solinteg_schedule.yaml README.md
+          git commit -m 'Fix planner post-commit reporting failures'
+          git push
