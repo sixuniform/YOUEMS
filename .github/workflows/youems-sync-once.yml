@@ -32,70 +32,33 @@ jobs:
           p = Path('solinteg_schedule.yaml')
           s = p.read_text()
           s = one(s, 'state: "2026.08.25.16.31"', 'state: "2026.08.27.00.18"', 'version')
-          s = one(s, '''  youems_pv_shortfall_response_pct:
-            name: "PV Shortfall Response"
-            min: 5
-            max: 100
-            step: 5
-          ''', '''  youems_pv_shortfall_response_pct:
-            name: "PV Shortfall Response"
-            min: 1
-            max: 100
-            step: 1
-          ''', 'shortfall helper')
-          s = one(s, '''          energy_weight_rule: "learning response is scaled by expected P50 energy / 3.0 kWh, capped at 100%"
-          ''', '''          energy_weight_rule: "shortfall response is scaled by expected P50 energy / 3.0 kWh, capped at 100%; recovery is not energy-weighted"
-          ''', 'energy rule')
-          s = one(s, '''      Recovery uses actual/P50. Learning response is weighted by total expected P50
-                energy so low-energy sunrise/sunset deviations have little influence while large
-                daytime shortfalls remain important. Learning runs even when PV Forecast Adaptation
-          ''', '''      Recovery uses actual/P50. Downward learning response is weighted by total expected
-                P50 energy so low-energy sunrise/sunset deviations have little influence while
-                large daytime shortfalls remain important. Recovery is deliberately not
-                energy-weighted, allowing a valid clear-panel/clear-weather period to restore
-                confidence quickly. Learning runs even when PV Forecast Adaptation
-          ''', 'learner description')
-          s = one(s, '''          effective_shortfall_response: >
-                    {{ shortfall_response | float(0.50) * learning_energy_weight | float(0) }}
-                  effective_recovery_response: >
-                    {{ recovery_response | float(0.40) * learning_energy_weight | float(0) }}
-          ''', '''          effective_shortfall_response: >
-                    {{ shortfall_response | float(0.50) * learning_energy_weight | float(0) }}
-                  effective_recovery_response: >
-                    {{ recovery_response | float(0.40) }}
-          ''', 'recovery response')
+          s = one(s, '  youems_pv_shortfall_response_pct:\n    name: "PV Shortfall Response"\n    min: 5\n    max: 100\n    step: 5\n', '  youems_pv_shortfall_response_pct:\n    name: "PV Shortfall Response"\n    min: 1\n    max: 100\n    step: 1\n', 'shortfall helper')
+          s = one(s, '          energy_weight_rule: "learning response is scaled by expected P50 energy / 3.0 kWh, capped at 100%"\n', '          energy_weight_rule: "shortfall response is scaled by expected P50 energy / 3.0 kWh, capped at 100%; recovery is not energy-weighted"\n', 'energy rule')
+          s = one(s, '      Recovery uses actual/P50. Learning response is weighted by total expected P50\n      energy so low-energy sunrise/sunset deviations have little influence while large\n      daytime shortfalls remain important. Learning runs even when PV Forecast Adaptation\n', '      Recovery uses actual/P50. Downward learning response is weighted by total expected\n      P50 energy so low-energy sunrise/sunset deviations have little influence while\n      large daytime shortfalls remain important. Recovery is deliberately not\n      energy-weighted, allowing a valid clear-panel/clear-weather period to restore\n      confidence quickly. Learning runs even when PV Forecast Adaptation\n', 'learner description')
+          s = one(s, '          effective_shortfall_response: >\n            {{ shortfall_response | float(0.50) * learning_energy_weight | float(0) }}\n          effective_recovery_response: >\n            {{ recovery_response | float(0.40) * learning_energy_weight | float(0) }}\n', '          effective_shortfall_response: >\n            {{ shortfall_response | float(0.50) * learning_energy_weight | float(0) }}\n          effective_recovery_response: >\n            {{ recovery_response | float(0.40) }}\n', 'recovery response')
           p.write_text(s)
 
           p = Path('README.md')
           r = p.read_text()
           r = one(r, '- Scheduler: `v2026.08.25.16.31`', '- Scheduler: `v2026.08.27.00.18`', 'README version')
           anchor = '## Inverter communication watchdog\n'
-          note = '''### PV Availability snow-oriented response (2026.08.27.00.18)
-
-          PV Availability is primarily a long-duration snow/obstruction detector and secondarily
-          a persistent bad-weather correction. Its response is therefore intentionally asymmetric.
-
-          The `PV Shortfall Response` control now allows **1% steps from 1–100%** (previously the
-          minimum was 5%). Downward learning keeps the energy-significance weighting introduced in
-          v2026.08.25.16.31:
-
-          `effective shortfall response = configured shortfall × min(P50 energy / 3.0 kWh, 1)`
-
-          Recovery no longer receives that energy weighting:
-
-          `effective recovery response = configured recovery`
-
-          This means low-energy sunrise/sunset misses barely pull Availability downward, sustained
-          large daytime deficits can still accumulate over many observations, and a valid recovery
-          period can restore confidence rapidly even when forecast energy is only moderate.
-
-          The response controls are per accepted 30-minute observation, not per day. For example,
-          with a full-weight 36.5% observation, a 10% shortfall response gives approximately
-          `100 → 93.7 → 87.9%` in two accepted periods. For snow-oriented operation, **1–2%**
-          shortfall with **80–90% recovery** is a better starting range.
-
-          '''
-          if note.strip() not in r:
+          note = ('### PV Availability snow-oriented response (2026.08.27.00.18)\n\n'
+                  'PV Availability is primarily a long-duration snow/obstruction detector and secondarily\n'
+                  'a persistent bad-weather correction. Its response is therefore intentionally asymmetric.\n\n'
+                  'The `PV Shortfall Response` control now allows **1% steps from 1–100%** (previously the\n'
+                  'minimum was 5%). Downward learning keeps the energy-significance weighting introduced in\n'
+                  'v2026.08.25.16.31:\n\n'
+                  '`effective shortfall response = configured shortfall × min(P50 energy / 3.0 kWh, 1)`\n\n'
+                  'Recovery no longer receives that energy weighting:\n\n'
+                  '`effective recovery response = configured recovery`\n\n'
+                  'This means low-energy sunrise/sunset misses barely pull Availability downward, sustained\n'
+                  'large daytime deficits can still accumulate over many observations, and a valid recovery\n'
+                  'period can restore confidence rapidly even when forecast energy is only moderate.\n\n'
+                  'The response controls are per accepted 30-minute observation, not per day. For example,\n'
+                  'with a full-weight 36.5% observation, a 10% shortfall response gives approximately\n'
+                  '`100 → 93.7 → 87.9%` in two accepted periods. For snow-oriented operation, **1–2%**\n'
+                  'shortfall with **80–90% recovery** is a better starting range.\n\n')
+          if '### PV Availability snow-oriented response (2026.08.27.00.18)' not in r:
               if r.count(anchor) != 1:
                   raise SystemExit(f'README anchor count {r.count(anchor)}')
               r = r.replace(anchor, note + anchor, 1)
