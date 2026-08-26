@@ -17,7 +17,7 @@ The project has two main parts:
 
 This README describes:
 
-- Scheduler: `v2026.08.25.16.31`
+- Scheduler: `v2026.08.27.00.18`
 - Dashboard: `v2026.08.25.16.31`
 
 The tested system uses:
@@ -428,6 +428,30 @@ is off. With the toggle off, planner/pSOC calculations explicitly use 100% avail
 The dashboard keeps the learned value/status visible, and the visual `Solar adjusted`
 trace may still show the learned estimate for diagnostics.
 
+
+### PV Availability snow-oriented response (2026.08.27.00.18)
+
+PV Availability is primarily a long-duration snow/obstruction detector and secondarily
+a persistent bad-weather correction. Its response is therefore intentionally asymmetric.
+
+The `PV Shortfall Response` control now allows **1% steps from 1–100%** (previously the
+minimum was 5%). Downward learning keeps the energy-significance weighting introduced in
+v2026.08.25.16.31:
+
+`effective shortfall response = configured shortfall × min(P50 energy / 3.0 kWh, 1)`
+
+Recovery no longer receives that energy weighting:
+
+`effective recovery response = configured recovery`
+
+This means low-energy sunrise/sunset misses barely pull Availability downward, sustained
+large daytime deficits can still accumulate over many observations, and a valid recovery
+period can restore confidence rapidly even when forecast energy is only moderate.
+
+The response controls are per accepted 30-minute observation, not per day. For example,
+with a full-weight 36.5% observation, a 10% shortfall response gives approximately
+`100 → 93.7 → 87.9%` in two accepted periods. For snow-oriented operation, **1–2%**
+shortfall with **80–90% recovery** is a better starting range.
 
 ## Inverter communication watchdog
 ### Degraded-communication operating-mode policy
