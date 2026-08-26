@@ -1,0 +1,133 @@
+name: YOUEMS one-shot PV availability sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.sync/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply canonical YOUEMS update
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/youems.patch <<'PATCH'
+          diff --git a/solinteg_schedule.yaml b/solinteg_schedule.yaml
+          --- a/solinteg_schedule.yaml
+          +++ b/solinteg_schedule.yaml
+          @@ -1448,9 +1448,9 @@
+           
+             youems_pv_shortfall_response_pct:
+               name: "PV Shortfall Response"
+          -    min: 5
+          +    min: 1
+               max: 100
+          -    step: 5
+          +    step: 1
+               unit_of_measurement: "%"
+               mode: slider
+               icon: mdi:trending-down
+          @@ -3434,7 +3434,7 @@
+                     learning_window: "completed Solcast 30-minute periods"
+                     minimum_p50_energy_kwh: 0.25
+                     full_learning_weight_p50_kwh: 3.0
+          -          energy_weight_rule: "learning response is scaled by expected P50 energy / 3.0 kWh, capped at 100%"
+          +          energy_weight_rule: "shortfall response is scaled by expected P50 energy / 3.0 kWh, capped at 100%; recovery is not energy-weighted"
+                     application_rule: "learning always runs; PV Forecast Adaptation controls whether the learned factor is applied to planning"
+                     downward_gate: "actual energy below Solcast P10 energy"
+                     observation_deadband_pct_points: 2
+          @@ -4351,7 +4351,7 @@
+           
+                 - name: "YOUEMS Schedule Version"
+                   icon: mdi:tag-check
+          -        state: "2026.08.25.16.31"
+          +        state: "2026.08.27.00.18"
+           
+                 - name: "Solar Excess Raw"
+                   unique_id: solar_excess_raw
+          @@ -7098,9 +7098,11 @@
+               description: |
+                 At each completed Solcast 30-minute period, compare integrated actual PV energy
+                 against raw Solcast P50/P10. Downward learning requires actual energy below P10.
+          -      Recovery uses actual/P50. Learning response is weighted by total expected P50
+          -      energy so low-energy sunrise/sunset deviations have little influence while large
+          -      daytime shortfalls remain important. Learning runs even when PV Forecast Adaptation
+          +      Recovery uses actual/P50. Downward learning response is weighted by total expected
+          +      P50 energy so low-energy sunrise/sunset deviations have little influence while
+          +      large daytime shortfalls remain important. Recovery is deliberately not
+          +      energy-weighted, allowing a valid clear-panel/clear-weather period to restore
+          +      confidence quickly. Learning runs even when PV Forecast Adaptation
+                 is disabled; the toggle controls planner application only. A whole period is
+                 rejected if PV PLim occurred, or if EMS CmdLim occurred while 50208 was restrictive.
+               triggers:
+          @@ -7185,7 +7187,7 @@
+                     effective_shortfall_response: >
+                       {{ shortfall_response | float(0.50) * learning_energy_weight | float(0) }}
+                     effective_recovery_response: >
+          -            {{ recovery_response | float(0.40) * learning_energy_weight | float(0) }}
+          +            {{ recovery_response | float(0.40) }}
+                     update_direction: >
+                       {% if eligible
+                             and observed_pct | float(0) < current_factor_pct | float(100) - 2
+          diff --git a/README.md b/README.md
+          --- a/README.md
+          +++ b/README.md
+          @@ -17,7 +17,7 @@
+           
+           This README describes:
+           
+          -- Scheduler: `v2026.08.25.16.31`
+          +- Scheduler: `v2026.08.27.00.18`
+           - Dashboard: `v2026.08.25.16.31`
+           
+           The tested system uses:
+          @@ -429,6 +429,32 @@
+           trace may still show the learned estimate for diagnostics.
+           
+           
+          +
+          +### PV Availability snow-oriented response (2026.08.27.00.18)
+          +
+          +PV Availability is primarily a long-duration snow/obstruction detector and secondarily
+          +a persistent bad-weather correction. Its response is therefore intentionally asymmetric.
+          +
+          +The `PV Shortfall Response` control now allows **1% steps from 1–100%** (previously the
+          +minimum was 5%). Downward learning keeps the energy-significance weighting introduced in
+          +v2026.08.25.16.31:
+          +
+          +`effective shortfall response = configured shortfall × min(P50 energy / 3.0 kWh, 1)`
+          +
+          +Recovery no longer receives that energy weighting:
+          +
+          +`effective recovery response = configured recovery`
+          +
+          +This means low-energy sunrise/sunset misses barely pull Availability downward, sustained
+          +large daytime deficits can still accumulate over many observations, and a valid recovery
+          +period can restore confidence rapidly even when forecast energy is only moderate.
+          +
+          +The response controls are per accepted 30-minute observation, not per day. For example,
+          +with a full-weight 36.5% observation, a 10% shortfall response gives approximately
+          +`100 → 93.7 → 87.9%` in two accepted periods. For snow-oriented operation, **1–2%**
+          +shortfall with **80–90% recovery** is a better starting range.
+          +
+          +
+           ## Inverter communication watchdog
+           ### Degraded-communication operating-mode policy
+          PATCH
+          git apply --whitespace=nowarn /tmp/youems.patch
+          rm -rf .sync
+          rm -f .github/workflows/youems-sync-once.yml
+          git config user.name 'YOUEMS sync'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git commit -m 'Tune PV availability for snow detection'
+          git push
