@@ -4,7 +4,7 @@
 """Canonical shared Solinteg register metadata and translations.
 
 The original table was synchronized from Modbus Broker v5.12. Its metadata
-combines the current Solinteg Home Assistant plugin, Solinteg protocol v00.02,
+combines the current Solinteg Home Assistant plugin, Solinteg protocol v00.19,
 and controlled empirical observations. The cloud-frame simulator and Modbus
 Broker are intended to import this same module. It has no third-party runtime
 dependencies.
@@ -570,7 +570,7 @@ REGISTER_METADATA = {
     25009: {'name': 'Inverter Restart', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {1: 'Restart'}},
     25015: {'name': 'Overload Method Setting', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Rated', 1: '110% Overloading', 2: 'Limit'}},
     25020: {'name': 'Shadow Scan', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Off', 32767: 'On'}, 'flags': FLAGS_MPPT},
-    25021: {'name': 'PV Module ON/OFF Control', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'source': 'Solinteg register table v00.19'},
+    25021: {'name': 'PV Module ON/OFF Control', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'access': 'RW', 'source': 'Solinteg register table v00.19'},
     25023: {'name': 'Grid Phase Sequence Setting', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Auto', 1: 'Positive Sequence', 2: 'Negative Sequence'}, 'access': 'RW', 'source': 'Solinteg register table v00.19'},
     25100: {'name': 'Export Limit Switch', 'type': 'U16', 'words': 1, 'scale': 1, 'unit': '', 'map': {0: 'Off', 1: 'On'}},
     25103: {'name': 'Export Limit Value', 'type': 'S16', 'words': 1, 'scale': 0.1, 'unit': '%'},
@@ -653,6 +653,7 @@ REGISTER_METADATA = {
     33016: {'name': 'BMS Error Code', 'type': 'U32', 'words': 2, 'scale': 1, 'unit': '', 'flags': BMS_ERROR_FLAGS},
     33018: {'name': 'BMS Warning Code', 'type': 'U32', 'words': 2, 'scale': 1, 'unit': '', 'flags': BMS_WARNING_FLAGS},
     33020: {'name': 'BMS Charge Cutoff Voltage', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': 'V'},
+    33022: {'name': 'BMS Discharge Cutoff Voltage', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': 'V'},
     33024: {'name': 'BMS Info Code', 'type': 'U32', 'words': 2, 'scale': 1, 'unit': ''},
     33041: {'name': 'BMS Warning Code (Extended)', 'type': 'U32', 'words': 2, 'scale': 1, 'unit': ''},
     33021: {'name': 'Battery Charge Limit', 'type': 'U16', 'words': 1, 'scale': 0.1, 'unit': 'A'},
